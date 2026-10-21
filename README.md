@@ -43,4 +43,6 @@ Python, Django, Django REST Framework, PostgreSQL (React frontend planned).
 
 ## Status
 
-In progress. Project skeleton and custom User model done.
+In progress. Done: project setup, custom User with roles, Batch/Student/Enrollment,
+FeePlan/Installment/LedgerEntry models with database constraints.
+Next: append-only trigger, reverse_payment(), tests.
