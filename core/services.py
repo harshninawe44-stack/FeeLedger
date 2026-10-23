@@ -1,8 +1,8 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import DecimalField, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import DecimalField, F, OuterRef, Subquery, Sum, Value
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
 from .models import FeePlan, Installment, LedgerEntry
@@ -105,4 +105,47 @@ def create_installments(*, fee_plan, due_dates):
             Installment(fee_plan=plan, number=i + 1, amount=amount, due_date=due)
             for i, (amount, due) in enumerate(zip(amounts, due_dates))
         ]
+    )
+
+MONEY = DecimalField(max_digits=12, decimal_places=2)
+ZERO = Value(Decimal("0.00"), output_field=MONEY)
+
+
+def _total_per_plan(queryset, field):
+    """A small query: the sum of `field` for one fee plan (the outer row)."""
+    return Coalesce(
+        Subquery(
+            queryset.filter(fee_plan=OuterRef("pk"))
+            .order_by()  # clear default ordering so grouping stays clean
+            .values("fee_plan")
+            .annotate(total=Sum(field))
+            .values("total"),
+            output_field=MONEY,
+        ),
+        ZERO,
+    )
+
+
+def dues_report(*, fee_plans=None, today=None):
+    """One row per fee plan, with paid / due so far / overdue / balance.
+
+    Everything is computed by the database in a single query.
+    """
+    today = today or timezone.localdate()
+    if fee_plans is None:
+        fee_plans = FeePlan.objects.all()
+
+    return (
+        fee_plans.select_related("enrollment__student", "enrollment__batch")
+        .annotate(
+            paid=_total_per_plan(LedgerEntry.objects.all(), "amount"),
+            due_so_far=_total_per_plan(
+                Installment.objects.filter(due_date__lte=today), "amount"
+            ),
+        )
+        .annotate(
+            balance=F("total_amount") - F("paid"),
+            overdue=Greatest(F("due_so_far") - F("paid"), ZERO, output_field=MONEY),
+        )
+        .order_by("enrollment__batch__name", "enrollment__student__full_name")
     )

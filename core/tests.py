@@ -8,6 +8,7 @@ from .models import Batch, Enrollment, FeePlan, LedgerEntry, Student, User
 from .services import (
     LedgerError,
     create_installments,
+    dues_report,
     net_paid,
     record_payment,
     reverse_payment,
@@ -182,3 +183,86 @@ class InstallmentTests(TestCase):
         create_installments(fee_plan=self.plan, due_dates=dues)
         with self.assertRaises(LedgerError):
             create_installments(fee_plan=self.plan, due_dates=dues)
+
+class DuesReportTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            "owner3", password="pw", role=User.Role.OWNER
+        )
+        teacher = User.objects.create_user(
+            "teacher3", password="pw", role=User.Role.TEACHER
+        )
+        self.batch = Batch.objects.create(
+            name="JEE", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+
+    def make_plan(self, name):
+        student = Student.objects.create(full_name=name)
+        enrollment = Enrollment.objects.create(
+            student=student, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        plan = FeePlan.objects.create(
+            enrollment=enrollment, total_amount=Decimal("60000.00")
+        )
+        create_installments(
+            fee_plan=plan,
+            due_dates=[
+                date(2026, 7, 1),
+                date(2026, 8, 1),
+                date(2026, 9, 1),
+                date(2026, 10, 1),
+            ],
+        )  # 4 x 15000.00
+        return plan
+
+    def pay(self, plan, amount):
+        return record_payment(
+            fee_plan=plan,
+            amount=Decimal(amount),
+            method="cash",
+            paid_on=date(2026, 7, 2),
+            received_by=self.owner,
+        )
+
+    def row_for(self, plan, today):
+        return dues_report(today=today).get(pk=plan.pk)
+
+    def test_no_payments_means_everything_due_is_overdue(self):
+        plan = self.make_plan("Asha")
+        row = self.row_for(plan, date(2026, 8, 15))
+        self.assertEqual(row.paid, Decimal("0.00"))
+        self.assertEqual(row.due_so_far, Decimal("30000.00"))
+        self.assertEqual(row.overdue, Decimal("30000.00"))
+        self.assertEqual(row.balance, Decimal("60000.00"))
+
+    def test_numbers_are_correct_with_many_installments_and_payments(self):
+        # 4 installments x 3 ledger rows: a wrongly joined query would
+        # multiply the totals. Subqueries must keep them exact.
+        plan = self.make_plan("Asha")
+        self.pay(plan, "15000.00")
+        wrong = self.pay(plan, "10000.00")
+        reverse_payment(entry=wrong, reason="Wrong student", received_by=self.owner)
+        row = self.row_for(plan, date(2026, 8, 15))
+        self.assertEqual(row.paid, Decimal("15000.00"))
+        self.assertEqual(row.due_so_far, Decimal("30000.00"))
+        self.assertEqual(row.overdue, Decimal("15000.00"))
+        self.assertEqual(row.balance, Decimal("45000.00"))
+
+    def test_paying_ahead_gives_zero_overdue_not_negative(self):
+        plan = self.make_plan("Asha")
+        self.pay(plan, "20000.00")
+        row = self.row_for(plan, date(2026, 7, 15))  # only 15000 due so far
+        self.assertEqual(row.overdue, Decimal("0.00"))
+        self.assertEqual(row.balance, Decimal("40000.00"))
+
+    def test_report_uses_one_query_no_matter_how_many_students(self):
+        for i in range(5):
+            plan = self.make_plan(f"Student {i}")
+            self.pay(plan, "15000.00")
+        with self.assertNumQueries(1):
+            rows = list(dues_report(today=date(2026, 8, 15)))
+            for r in rows:  # touching related data must not add queries
+                r.enrollment.student.full_name
+                r.enrollment.batch.name
+                r.paid, r.overdue, r.balance
+        self.assertEqual(len(rows), 5)
