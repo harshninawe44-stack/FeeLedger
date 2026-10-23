@@ -5,7 +5,7 @@ from django.db.models import DecimalField, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from .models import FeePlan, LedgerEntry
+from .models import FeePlan, Installment, LedgerEntry
 
 
 class LedgerError(Exception):
@@ -74,4 +74,35 @@ def reverse_payment(*, entry, reason, received_by, paid_on=None):
         paid_on=paid_on or timezone.localdate(),
         reverses=entry,
         received_by=received_by,
+    )
+
+def split_amount(total, parts):
+    """Split a total into `parts` amounts that add up to exactly the total."""
+    total = Decimal(total)
+    if parts < 1:
+        raise LedgerError("Need at least one installment.")
+    if total <= 0:
+        raise LedgerError("Total must be positive.")
+    if total != total.quantize(Decimal("0.01")):
+        raise LedgerError("Total can have at most 2 decimal places.")
+
+    paise = int(total.scaleb(2))  # 10000.00 rupees -> 1000000 paise
+    base, leftover = divmod(paise, parts)
+    # The first `leftover` installments each get one extra paisa.
+    amounts = [base + 1 if i < leftover else base for i in range(parts)]
+    return [Decimal(a).scaleb(-2) for a in amounts]  # back to rupees
+
+
+@transaction.atomic
+def create_installments(*, fee_plan, due_dates):
+    plan = FeePlan.objects.select_for_update().get(pk=fee_plan.pk)
+    if plan.installments.exists():
+        raise LedgerError("This fee plan already has installments.")
+
+    amounts = split_amount(plan.total_amount, len(due_dates))
+    return Installment.objects.bulk_create(
+        [
+            Installment(fee_plan=plan, number=i + 1, amount=amount, due_date=due)
+            for i, (amount, due) in enumerate(zip(amounts, due_dates))
+        ]
     )

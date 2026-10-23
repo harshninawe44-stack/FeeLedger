@@ -5,7 +5,14 @@ from django.db import DatabaseError, IntegrityError, transaction
 from django.test import TestCase
 
 from .models import Batch, Enrollment, FeePlan, LedgerEntry, Student, User
-from .services import LedgerError, net_paid, record_payment, reverse_payment
+from .services import (
+    LedgerError,
+    create_installments,
+    net_paid,
+    record_payment,
+    reverse_payment,
+    split_amount,
+)
 
 
 class LedgerTests(TestCase):
@@ -117,3 +124,61 @@ class LedgerTests(TestCase):
         with self.assertRaises(DatabaseError):
             with transaction.atomic():
                 entry.delete()
+
+
+class InstallmentTests(TestCase):
+    def setUp(self):
+        teacher = User.objects.create_user(
+            "teacher2", password="pw", role=User.Role.TEACHER
+        )
+        batch = Batch.objects.create(
+            name="NEET", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+        student = Student.objects.create(full_name="Ravi")
+        enrollment = Enrollment.objects.create(
+            student=student, batch=batch, joined_on=date(2026, 6, 1)
+        )
+        self.plan = FeePlan.objects.create(
+            enrollment=enrollment, total_amount=Decimal("10000.00")
+        )
+
+    def test_ten_thousand_split_in_three(self):
+        self.assertEqual(
+            split_amount("10000.00", 3),
+            [Decimal("3333.34"), Decimal("3333.33"), Decimal("3333.33")],
+        )
+
+    def test_even_split(self):
+        self.assertEqual(split_amount("60000.00", 4), [Decimal("15000.00")] * 4)
+
+    def test_split_always_adds_up_to_the_total(self):
+        for total in ["0.01", "1.00", "99.99", "10000.00", "59999.99", "123456.78"]:
+            for parts in range(1, 13):
+                amounts = split_amount(total, parts)
+                self.assertEqual(len(amounts), parts)
+                self.assertEqual(sum(amounts), Decimal(total))
+
+    def test_no_installment_differs_by_more_than_one_paisa(self):
+        amounts = split_amount("10000.00", 7)
+        self.assertLessEqual(max(amounts) - min(amounts), Decimal("0.01"))
+
+    def test_rejects_zero_parts(self):
+        with self.assertRaises(LedgerError):
+            split_amount("100.00", 0)
+
+    def test_rejects_more_than_two_decimal_places(self):
+        with self.assertRaises(LedgerError):
+            split_amount("100.005", 2)
+
+    def test_create_installments_saves_rows_that_sum_to_total(self):
+        dues = [date(2026, 7, 1), date(2026, 8, 1), date(2026, 9, 1)]
+        create_installments(fee_plan=self.plan, due_dates=dues)
+        rows = list(self.plan.installments.order_by("number"))
+        self.assertEqual([r.due_date for r in rows], dues)
+        self.assertEqual(sum(r.amount for r in rows), Decimal("10000.00"))
+
+    def test_installments_cannot_be_created_twice(self):
+        dues = [date(2026, 7, 1), date(2026, 8, 1)]
+        create_installments(fee_plan=self.plan, due_dates=dues)
+        with self.assertRaises(LedgerError):
+            create_installments(fee_plan=self.plan, due_dates=dues)
