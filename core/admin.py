@@ -1,7 +1,18 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 
-from .models import Batch, Enrollment, FeePlan, Installment, LedgerEntry, Student, User
+from .models import (
+    AttendanceChange,
+    AttendanceRecord,
+    AttendanceSession,
+    Batch,
+    Enrollment,
+    FeePlan,
+    Installment,
+    LedgerEntry,
+    Student,
+    User,
+)
 
 
 @admin.register(User)
@@ -34,3 +45,36 @@ class LedgerEntryAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+class ViewOnlyAdmin(admin.ModelAdmin):
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class AttendanceRecordInline(admin.TabularInline):
+    model = AttendanceRecord
+    extra = 0
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(AttendanceSession)
+class AttendanceSessionAdmin(ViewOnlyAdmin):
+    list_display = ("batch", "date", "created_by")
+    inlines = [AttendanceRecordInline]
+
+
+@admin.register(AttendanceChange)
+class AttendanceChangeAdmin(ViewOnlyAdmin):
+    list_display = ("record", "old_status", "new_status", "changed_by", "changed_at")

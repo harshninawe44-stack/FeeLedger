@@ -4,11 +4,24 @@ from decimal import Decimal
 from django.db import DatabaseError, IntegrityError, transaction
 from django.test import TestCase
 
-from .models import Batch, Enrollment, FeePlan, LedgerEntry, Student, User
+from .models import (
+    AttendanceChange,
+    AttendanceRecord,
+    AttendanceSession,
+    Batch,
+    Enrollment,
+    FeePlan,
+    LedgerEntry,
+    Student,
+    User,
+)
+
 from .services import (
+    AttendanceError,
     LedgerError,
     create_installments,
     dues_report,
+    mark_attendance,
     net_paid,
     record_payment,
     reverse_payment,
@@ -376,3 +389,117 @@ class ScopingTests(TestCase):
     def test_superuser_is_automatically_the_owner(self):
         root = User.objects.create_superuser("root", password="pw")
         self.assertEqual(root.role, User.Role.OWNER)
+
+S = AttendanceRecord.Status
+
+
+class AttendanceTests(TestCase):
+    TODAY = date(2026, 10, 24)
+    DAY = date(2026, 10, 20)  # 4 days before TODAY
+
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+
+        self.batch_a = Batch.objects.create(
+            name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent)
+        self.bala = Student.objects.create(full_name="Bala")
+        self.chetan = Student.objects.create(full_name="Chetan")  # has left
+        for student, active in [(self.asha, True), (self.bala, True), (self.chetan, False)]:
+            Enrollment.objects.create(
+                student=student,
+                batch=self.batch_a,
+                joined_on=date(2026, 6, 1),
+                is_active=active,
+            )
+
+    def sheet(self):
+        return {self.asha.id: S.PRESENT, self.bala.id: S.ABSENT}
+
+    def mark(self, user=None, statuses=None, day=None):
+        return mark_attendance(
+            batch=self.batch_a,
+            date=day or self.DAY,
+            statuses=statuses or self.sheet(),
+            marked_by=user or self.teacher_a,
+            today=self.TODAY,
+        )
+
+    def test_marks_whole_batch_in_one_call(self):
+        session = self.mark()
+        self.assertEqual(session.records.count(), 2)
+        self.assertEqual(session.records.get(student=self.asha).status, S.PRESENT)
+        self.assertEqual(session.records.get(student=self.bala).status, S.ABSENT)
+        # first marking is logged with an empty "old" status
+        self.assertEqual(AttendanceChange.objects.count(), 2)
+        self.assertEqual(AttendanceChange.objects.filter(old_status="").count(), 2)
+
+    def test_editing_a_status_writes_an_audit_entry(self):
+        self.mark()
+        edited = self.sheet()
+        edited[self.bala.id] = S.LATE
+        self.mark(statuses=edited)
+        record = AttendanceRecord.objects.get(student=self.bala)
+        self.assertEqual(record.status, S.LATE)
+        change = AttendanceChange.objects.order_by("id").last()
+        self.assertEqual(change.old_status, S.ABSENT)
+        self.assertEqual(change.new_status, S.LATE)
+        self.assertEqual(change.changed_by, self.teacher_a)
+        self.assertEqual(AttendanceChange.objects.count(), 3)
+
+    def test_resubmitting_the_same_sheet_creates_no_new_changes(self):
+        self.mark()
+        self.mark()
+        self.assertEqual(AttendanceChange.objects.count(), 2)
+
+    def test_teacher_cannot_mark_another_teachers_batch(self):
+        with self.assertRaises(AttendanceError):
+            self.mark(user=self.teacher_b)
+
+    def test_parent_cannot_mark_attendance(self):
+        with self.assertRaises(AttendanceError):
+            self.mark(user=self.parent)
+
+    def test_owner_can_mark_any_batch(self):
+        self.mark(user=self.owner)
+        self.assertEqual(AttendanceSession.objects.count(), 1)
+
+    def test_future_date_is_rejected(self):
+        with self.assertRaises(AttendanceError):
+            self.mark(day=date(2026, 10, 25))
+
+    def test_teacher_is_limited_to_the_edit_window_but_owner_is_not(self):
+        self.mark(day=date(2026, 10, 17))  # exactly 7 days ago: allowed
+        old_day = date(2026, 10, 10)  # 14 days ago
+        with self.assertRaises(AttendanceError):
+            self.mark(day=old_day)
+        self.mark(user=self.owner, day=old_day)
+
+    def test_incomplete_sheet_is_rejected(self):
+        with self.assertRaises(AttendanceError):
+            self.mark(statuses={self.asha.id: S.PRESENT})
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_student_who_left_the_batch_cannot_be_marked(self):
+        sheet = self.sheet()
+        sheet[self.chetan.id] = S.PRESENT
+        with self.assertRaises(AttendanceError):
+            self.mark(statuses=sheet)
+
+    def test_invalid_status_is_rejected(self):
+        sheet = self.sheet()
+        sheet[self.bala.id] = "sleeping"
+        with self.assertRaises(AttendanceError):
+            self.mark(statuses=sheet)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_only_one_session_per_batch_per_date(self):
+        self.mark()
+        self.mark()
+        self.assertEqual(AttendanceSession.objects.count(), 1)
+        self.assertEqual(AttendanceRecord.objects.count(), 2)

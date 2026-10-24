@@ -173,3 +173,72 @@ class LedgerEntry(models.Model):
 
     def __str__(self):
         return f"{self.kind} {self.amount} on {self.paid_on}"
+
+class AttendanceSession(models.Model):
+    """One class held by one batch on one date."""
+
+    batch = models.ForeignKey(
+        Batch, on_delete=models.PROTECT, related_name="attendance_sessions"
+    )
+    date = models.DateField()
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_sessions_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["batch", "date"], name="unique_session_per_batch_per_day"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.batch} on {self.date}"
+
+
+class AttendanceRecord(models.Model):
+    class Status(models.TextChoices):
+        PRESENT = "present", "Present"
+        ABSENT = "absent", "Absent"
+        LATE = "late", "Late"
+        LEAVE = "leave", "On leave"
+
+    session = models.ForeignKey(
+        AttendanceSession, on_delete=models.CASCADE, related_name="records"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.PROTECT, related_name="attendance_records"
+    )
+    status = models.CharField(max_length=10, choices=Status.choices)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["session", "student"], name="unique_record_per_student_per_session"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.student}: {self.status} ({self.session})"
+
+
+class AttendanceChange(models.Model):
+    """Audit log: one row each time a record is first set or later changed."""
+
+    record = models.ForeignKey(
+        AttendanceRecord, on_delete=models.CASCADE, related_name="changes"
+    )
+    old_status = models.CharField(max_length=10, blank=True)  # empty = first marking
+    new_status = models.CharField(max_length=10)
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_changes",
+    )
+    changed_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.record.student}: {self.old_status or '-'} -> {self.new_status}"

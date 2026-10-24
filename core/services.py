@@ -5,7 +5,17 @@ from django.db.models import DecimalField, F, OuterRef, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
-from .models import FeePlan, Installment, LedgerEntry
+from .models import (
+    AttendanceChange,
+    AttendanceRecord,
+    AttendanceSession,
+    Enrollment,
+    FeePlan,
+    Installment,
+    LedgerEntry,
+    User,
+)
+from .selectors import batches_for
 
 
 class LedgerError(Exception):
@@ -149,3 +159,83 @@ def dues_report(*, fee_plans=None, today=None):
         )
         .order_by("enrollment__batch__name", "enrollment__student__full_name")
     )
+
+TEACHER_EDIT_WINDOW_DAYS = 7
+
+
+class AttendanceError(Exception):
+    """Raised when an attendance action would break a rule."""
+
+
+@transaction.atomic
+def mark_attendance(*, batch, date, statuses, marked_by, today=None):
+    """Save a whole batch's attendance for one date.
+
+    `statuses` maps student id -> status, e.g. {5: "present", 6: "absent"}.
+    Calling it again for the same batch and date edits the sheet, and every
+    change is written to the audit log.
+    """
+    today = today or timezone.localdate()
+
+    if marked_by.role not in (User.Role.OWNER, User.Role.TEACHER):
+        raise AttendanceError("Only owners and teachers can mark attendance.")
+    if not batches_for(marked_by).filter(pk=batch.pk).exists():
+        raise AttendanceError("Batch not found.")
+    if date > today:
+        raise AttendanceError("Cannot mark attendance for a future date.")
+    if (
+        marked_by.role == User.Role.TEACHER
+        and (today - date).days > TEACHER_EDIT_WINDOW_DAYS
+    ):
+        raise AttendanceError(
+            f"Teachers can only mark the last {TEACHER_EDIT_WINDOW_DAYS} days. "
+            "Ask the owner to make this change."
+        )
+
+    enrolled_ids = set(
+        Enrollment.objects.filter(batch=batch, is_active=True).values_list(
+            "student_id", flat=True
+        )
+    )
+    if set(statuses) != enrolled_ids:
+        raise AttendanceError(
+            "The sheet must list exactly the students enrolled in this batch."
+        )
+    valid = set(AttendanceRecord.Status.values)
+    if any(status not in valid for status in statuses.values()):
+        raise AttendanceError("Unknown attendance status.")
+
+    session, _ = AttendanceSession.objects.get_or_create(
+        batch=batch, date=date, defaults={"created_by": marked_by}
+    )
+    existing = {r.student_id: r for r in session.records.all()}
+
+    new_records, edited_records, changes = [], [], []
+    for student_id, status in statuses.items():
+        record = existing.get(student_id)
+        if record is None:
+            new_records.append(
+                AttendanceRecord(session=session, student_id=student_id, status=status)
+            )
+        elif record.status != status:
+            changes.append(
+                AttendanceChange(
+                    record=record,
+                    old_status=record.status,
+                    new_status=status,
+                    changed_by=marked_by,
+                )
+            )
+            record.status = status
+            edited_records.append(record)
+
+    created = AttendanceRecord.objects.bulk_create(new_records)
+    AttendanceRecord.objects.bulk_update(edited_records, ["status"])
+    changes += [
+        AttendanceChange(
+            record=r, old_status="", new_status=r.status, changed_by=marked_by
+        )
+        for r in created
+    ]
+    AttendanceChange.objects.bulk_create(changes)
+    return session
