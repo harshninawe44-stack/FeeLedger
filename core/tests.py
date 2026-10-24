@@ -15,6 +15,16 @@ from .services import (
     split_amount,
 )
 
+from django.contrib.auth.models import AnonymousUser
+
+from .selectors import (
+    batches_for,
+    enrollments_for,
+    fee_plans_for,
+    ledger_entries_for,
+    students_for,
+)
+
 
 class LedgerTests(TestCase):
     def setUp(self):
@@ -266,3 +276,103 @@ class DuesReportTests(TestCase):
                 r.enrollment.batch.name
                 r.paid, r.overdue, r.balance
         self.assertEqual(len(rows), 5)
+
+class ScopingTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        self.parent_b = mk("pb", password="pw", role=User.Role.STUDENT)
+
+        self.batch_a = Batch.objects.create(
+            name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        self.batch_b = Batch.objects.create(
+            name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.bala = Student.objects.create(full_name="Bala", user=self.parent_b)
+        self.enr_a = Enrollment.objects.create(
+            student=self.asha, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        self.enr_b = Enrollment.objects.create(
+            student=self.bala, batch=self.batch_b, joined_on=date(2026, 6, 1)
+        )
+        self.plan_a = FeePlan.objects.create(
+            enrollment=self.enr_a, total_amount=Decimal("10000.00")
+        )
+        self.plan_b = FeePlan.objects.create(
+            enrollment=self.enr_b, total_amount=Decimal("10000.00")
+        )
+        self.pay_a = record_payment(
+            fee_plan=self.plan_a, amount=Decimal("1000.00"), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.owner,
+        )
+        record_payment(
+            fee_plan=self.plan_b, amount=Decimal("2000.00"), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.owner,
+        )
+
+    def test_owner_sees_everything(self):
+        self.assertEqual(batches_for(self.owner).count(), 2)
+        self.assertEqual(students_for(self.owner).count(), 2)
+        self.assertEqual(fee_plans_for(self.owner).count(), 2)
+        self.assertEqual(ledger_entries_for(self.owner).count(), 2)
+
+    def test_teacher_sees_only_own_batch_and_its_students(self):
+        self.assertEqual(list(batches_for(self.teacher_a)), [self.batch_a])
+        self.assertEqual(list(students_for(self.teacher_a)), [self.asha])
+        self.assertEqual(list(enrollments_for(self.teacher_a)), [self.enr_a])
+
+    def test_teacher_cannot_reach_another_teachers_batch(self):
+        self.assertFalse(
+            batches_for(self.teacher_a).filter(pk=self.batch_b.pk).exists()
+        )
+        self.assertFalse(
+            students_for(self.teacher_a).filter(pk=self.bala.pk).exists()
+        )
+
+    def test_teacher_sees_no_fee_data(self):
+        self.assertEqual(fee_plans_for(self.teacher_a).count(), 0)
+        self.assertEqual(ledger_entries_for(self.teacher_a).count(), 0)
+
+    def test_parent_sees_only_own_child(self):
+        self.assertEqual(list(students_for(self.parent_a)), [self.asha])
+        self.assertEqual(list(batches_for(self.parent_a)), [self.batch_a])
+        self.assertEqual(list(fee_plans_for(self.parent_a)), [self.plan_a])
+        self.assertEqual(list(ledger_entries_for(self.parent_a)), [self.pay_a])
+
+    def test_parent_cannot_reach_another_familys_data(self):
+        self.assertFalse(
+            fee_plans_for(self.parent_a).filter(pk=self.plan_b.pk).exists()
+        )
+        self.assertFalse(
+            students_for(self.parent_a).filter(pk=self.bala.pk).exists()
+        )
+
+    def test_parent_with_two_children_in_one_batch_sees_it_once(self):
+        brother = Student.objects.create(full_name="Chetan", user=self.parent_a)
+        Enrollment.objects.create(
+            student=brother, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        self.assertEqual(batches_for(self.parent_a).count(), 1)
+        self.assertEqual(students_for(self.parent_a).count(), 2)
+
+    def test_anonymous_user_sees_nothing(self):
+        nobody = AnonymousUser()
+        self.assertEqual(batches_for(nobody).count(), 0)
+        self.assertEqual(students_for(nobody).count(), 0)
+        self.assertEqual(fee_plans_for(nobody).count(), 0)
+
+    def test_dues_report_respects_scoping(self):
+        today = date(2026, 8, 1)
+        rows = dues_report(fee_plans=fee_plans_for(self.parent_a), today=today)
+        self.assertEqual([r.pk for r in rows], [self.plan_a.pk])
+        rows = dues_report(fee_plans=fee_plans_for(self.teacher_a), today=today)
+        self.assertEqual(len(list(rows)), 0)
+
+    def test_superuser_is_automatically_the_owner(self):
+        root = User.objects.create_superuser("root", password="pw")
+        self.assertEqual(root.role, User.Role.OWNER)

@@ -13,7 +13,14 @@ class User(AbstractUser):
         max_length=10,
         choices=Role.choices,
         default=Role.STUDENT,
+        
     )
+
+    def save(self, *args, **kwargs):
+        # A Django superuser is always the Owner of the class.
+        if self.is_superuser:
+            self.role = self.Role.OWNER
+        super().save(*args, **kwargs)
 
 class Batch(models.Model):
     name = models.CharField(max_length=100)
