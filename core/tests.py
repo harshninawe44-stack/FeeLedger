@@ -38,6 +38,11 @@ from .selectors import (
     students_for,
 )
 
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
+from rest_framework.test import APIClient
+
 
 class LedgerTests(TestCase):
     def setUp(self):
@@ -503,3 +508,123 @@ class AttendanceTests(TestCase):
         self.mark()
         self.assertEqual(AttendanceSession.objects.count(), 1)
         self.assertEqual(AttendanceRecord.objects.count(), 2)
+
+class ApiTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        self.parent_b = mk("pb", password="pw", role=User.Role.STUDENT)
+
+        self.batch_a = Batch.objects.create(
+            name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        self.batch_b = Batch.objects.create(
+            name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.bala = Student.objects.create(full_name="Bala", user=self.parent_b)
+        enr_a = Enrollment.objects.create(
+            student=self.asha, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        enr_b = Enrollment.objects.create(
+            student=self.bala, batch=self.batch_b, joined_on=date(2026, 6, 1)
+        )
+        self.plan_a = FeePlan.objects.create(
+            enrollment=enr_a, total_amount=Decimal("10000.00")
+        )
+        self.plan_b = FeePlan.objects.create(
+            enrollment=enr_b, total_amount=Decimal("10000.00")
+        )
+        record_payment(
+            fee_plan=self.plan_a, amount=Decimal("1000.00"), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.owner,
+        )
+        record_payment(
+            fee_plan=self.plan_b, amount=Decimal("2000.00"), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.owner,
+        )
+        self.api = APIClient()
+
+    def get(self, user, url):
+        self.api.force_authenticate(user=user)
+        return self.api.get(url)
+
+    def count_queries(self, user, url):
+        self.api.force_authenticate(user=user)
+        with CaptureQueriesContext(connection) as ctx:
+            self.api.get(url)
+        return len(ctx)
+
+    def test_anonymous_user_is_rejected(self):
+        response = self.get(None, reverse("batch-list"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_me_returns_the_role(self):
+        response = self.get(self.teacher_a, reverse("me"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["role"], "teacher")
+
+    def test_teacher_lists_only_own_batches(self):
+        response = self.get(self.teacher_a, reverse("batch-list"))
+        names = [b["name"] for b in response.data["results"]]
+        self.assertEqual(names, ["A"])
+
+    def test_teacher_gets_404_for_another_teachers_batch(self):
+        url = reverse("batch-detail", args=[self.batch_b.pk])
+        self.assertEqual(self.get(self.teacher_a, url).status_code, 404)
+        self.assertEqual(self.get(self.teacher_b, url).status_code, 200)
+
+    def test_parent_gets_404_for_another_familys_student(self):
+        url = reverse("student-detail", args=[self.bala.pk])
+        self.assertEqual(self.get(self.parent_a, url).status_code, 404)
+
+    def test_teacher_is_forbidden_from_dues(self):
+        response = self.get(self.teacher_a, reverse("dues"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_parent_sees_only_own_dues_and_money_is_a_string(self):
+        response = self.get(self.parent_a, reverse("dues"))
+        rows = response.data["results"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["student"], "Asha")
+        self.assertEqual(rows[0]["total_amount"], "10000.00")
+        self.assertEqual(rows[0]["paid"], "1000.00")
+        self.assertEqual(rows[0]["balance"], "9000.00")
+
+    def test_owner_sees_all_dues(self):
+        response = self.get(self.owner, reverse("dues"))
+        self.assertEqual(len(response.data["results"]), 2)
+
+    def test_dues_query_count_does_not_grow_with_more_students(self):
+        before = self.count_queries(self.owner, reverse("dues"))
+        for i in range(5):
+            student = Student.objects.create(full_name=f"Extra {i}")
+            enr = Enrollment.objects.create(
+                student=student, batch=self.batch_a, joined_on=date(2026, 6, 1)
+            )
+            plan = FeePlan.objects.create(
+                enrollment=enr, total_amount=Decimal("5000.00")
+            )
+            record_payment(
+                fee_plan=plan, amount=Decimal("100.00"), method="cash",
+                paid_on=date(2026, 7, 1), received_by=self.owner,
+            )
+        after = self.count_queries(self.owner, reverse("dues"))
+        self.assertEqual(before, after)
+
+    def test_batch_list_query_count_does_not_grow_with_more_batches(self):
+        before = self.count_queries(self.owner, reverse("batch-list"))
+        for i in range(5):
+            Batch.objects.create(
+                name=f"Extra {i}", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+            )
+        after = self.count_queries(self.owner, reverse("batch-list"))
+        self.assertEqual(before, after)
+
+    def test_api_is_read_only(self):
+        self.api.force_authenticate(user=self.owner)
+        response = self.api.post(reverse("batch-list"), {"name": "Hacked"})
+        self.assertEqual(response.status_code, 405)
