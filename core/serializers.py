@@ -116,3 +116,10 @@ class FeePlanInputSerializer(serializers.Serializer):
     due_dates = serializers.ListField(
         child=serializers.DateField(), min_length=1, max_length=24
     )
+
+# ---- CSV import -----------------------------------------------------------
+
+
+class ImportUploadSerializer(serializers.Serializer):
+    file = serializers.FileField()
+    commit = serializers.BooleanField(default=False)

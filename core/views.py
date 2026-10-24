@@ -5,6 +5,10 @@ from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from rest_framework.parsers import MultiPartParser
+
+from .importers import MAX_BYTES, ImportFileError, import_students
+
 from .models import AttendanceRecord, Enrollment, User
 from .selectors import (
     batches_for,
@@ -24,6 +28,7 @@ from .serializers import (
     PaymentInputSerializer,
     ReverseInputSerializer,
     StudentSerializer,
+    ImportUploadSerializer
 )
 
 from .services import (
@@ -278,3 +283,29 @@ class FeePlanViewSet(
         except LedgerError as error:
             raise ValidationError({"detail": str(error)})
         return Response(FeePlanSerializer(plan).data, status=201)
+
+# ---- CSV import -----------------------------------------------------------
+
+
+class ImportStudentsView(generics.GenericAPIView):
+    """Upload a CSV of students. Without commit=true it only previews."""
+
+    parser_classes = [MultiPartParser]
+    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    serializer_class = ImportUploadSerializer
+
+    def post(self, request):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        upload = body.validated_data["file"]
+        try:
+            result = import_students(
+                raw=upload.read(MAX_BYTES + 1),  # never read more than the limit
+                commit=body.validated_data["commit"],
+            )
+        except ImportFileError as error:
+            raise ValidationError({"detail": str(error)})
+
+        if result["errors"]:
+            return Response(result, status=400)
+        return Response(result, status=201 if result["committed"] else 200)

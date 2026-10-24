@@ -2,6 +2,10 @@ from datetime import date, timedelta
 from django.utils import timezone
 from decimal import Decimal
 
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+from .importers import ImportFileError, import_students
+
 from django.db import DatabaseError, IntegrityError, transaction
 from django.test import TestCase
 
@@ -1076,3 +1080,252 @@ class FeePlanApiTests(TestCase):
         with CaptureQueriesContext(connection) as after:
             self.api.get(url)
         self.assertEqual(len(before), len(after))
+
+class ImportServiceTests(TestCase):
+    HEADER = "full_name,phone,guardian_name,batch,joined_on"
+
+    def setUp(self):
+        teacher = User.objects.create_user(
+            "t_imp", password="pw", role=User.Role.TEACHER
+        )
+        mk = Batch.objects.create
+        self.jee = mk(name="JEE Morning", teacher=teacher, start_date=date(2026, 6, 1))
+        self.neet = mk(name="NEET Evening", teacher=teacher, start_date=date(2026, 6, 1))
+        mk(name="Old Batch", teacher=teacher, start_date=date(2025, 6, 1), is_active=False)
+        mk(name="Twin", teacher=teacher, start_date=date(2026, 6, 1))
+        mk(name="twin", teacher=teacher, start_date=date(2026, 6, 1))
+
+    def make_csv(self, *lines, header=None):
+        return "\n".join([header or self.HEADER, *lines]).encode("utf-8")
+
+    def run_import(self, *lines, commit=False, header=None):
+        return import_students(raw=self.make_csv(*lines, header=header), commit=commit)
+
+    def test_preview_saves_nothing(self):
+        result = self.run_import(
+            "Asha Rao,9876543210,Mr Rao,JEE Morning,2026-06-01",
+            "Ravi Kumar,9123456780,,NEET Evening,",
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertFalse(result["committed"])
+        self.assertEqual(result["new_students"], 2)
+        self.assertEqual(result["new_enrollments"], 2)
+        self.assertEqual(Student.objects.count(), 0)
+        self.assertEqual(Enrollment.objects.count(), 0)
+
+    def test_commit_saves_students_and_enrollments(self):
+        result = self.run_import(
+            "Asha Rao,9876543210,Mr Rao,JEE Morning,2026-06-15",
+            "Ravi Kumar,9123456780,,NEET Evening,",
+            commit=True,
+        )
+        self.assertTrue(result["committed"])
+        asha = Student.objects.get(full_name="Asha Rao")
+        self.assertEqual(asha.phone, "9876543210")
+        self.assertEqual(asha.guardian_name, "Mr Rao")
+        enrollment = Enrollment.objects.get(student=asha)
+        self.assertEqual(enrollment.batch, self.jee)
+        self.assertEqual(enrollment.joined_on, date(2026, 6, 15))
+        self.assertEqual(Student.objects.count(), 2)
+        self.assertEqual(Enrollment.objects.count(), 2)
+
+    def test_phone_is_normalised(self):
+        self.run_import(
+            "Asha,98765-43210,,JEE Morning,",
+            "Ravi,+91 91234 56780,,JEE Morning,",
+            commit=True,
+        )
+        self.assertEqual(Student.objects.get(full_name="Asha").phone, "9876543210")
+        self.assertEqual(Student.objects.get(full_name="Ravi").phone, "+919123456780")
+
+    def test_headers_are_case_insensitive_and_trimmed(self):
+        result = self.run_import(
+            "Asha,9876543210,JEE Morning",
+            header=" Full_Name , PHONE , Batch ",
+            commit=True,
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(Student.objects.count(), 1)
+
+    def test_blank_lines_are_skipped(self):
+        result = self.run_import(
+            "", "Asha,9876543210,,JEE Morning,", ",,,,", "", commit=True
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["rows"], 1)
+
+    def test_joined_on_defaults_to_today(self):
+        self.run_import("Asha,9876543210,,JEE Morning,", commit=True)
+        self.assertEqual(Enrollment.objects.get().joined_on, timezone.localdate())
+
+    def test_one_bad_row_saves_nothing_and_reports_line_number(self):
+        result = self.run_import(
+            "Asha,9876543210,,JEE Morning,",  # line 2
+            "Ravi,9123456780,,NEET Evening,",  # line 3
+            "Meera,9000000001,,No Such Batch,",  # line 4
+            commit=True,
+        )
+        self.assertFalse(result["committed"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["row"], 4)
+        self.assertEqual(result["errors"][0]["field"], "batch")
+        self.assertEqual(Student.objects.count(), 0)
+        self.assertEqual(Enrollment.objects.count(), 0)
+
+    def test_each_kind_of_bad_row_is_reported_on_the_right_field(self):
+        cases = [
+            (",9876543210,,JEE Morning,", "full_name"),
+            ("Asha,,,JEE Morning,", "phone"),
+            ("Asha,12345,,JEE Morning,", "phone"),
+            ("Asha,98765abcde,,JEE Morning,", "phone"),
+            ("Asha,9876543210,,,", "batch"),
+            ("Asha,9876543210,,Old Batch,", "batch"),
+            ("Asha,9876543210,,Twin,", "batch"),
+            ("Asha,9876543210,,JEE Morning,01/06/2026", "joined_on"),
+            ("Asha,9876543210,,JEE Morning,2026-02-31", "joined_on"),
+            ("A" * 151 + ",9876543210,,JEE Morning,", "full_name"),
+        ]
+        for line, field in cases:
+            result = self.run_import(line)
+            self.assertEqual(len(result["errors"]), 1, line)
+            self.assertEqual(result["errors"][0]["field"], field, line)
+            self.assertEqual(result["errors"][0]["row"], 2, line)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_duplicate_row_in_file_is_rejected(self):
+        result = self.run_import(
+            "Asha,9876543210,,JEE Morning,",
+            "asha,9876543210,,jee morning,",
+        )
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["row"], 3)
+
+    def test_already_enrolled_student_is_rejected(self):
+        asha = Student.objects.create(full_name="Asha", phone="9876543210")
+        Enrollment.objects.create(
+            student=asha, batch=self.jee, joined_on=date(2026, 6, 1)
+        )
+        result = self.run_import("Asha,9876543210,,JEE Morning,", commit=True)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["field"], "batch")
+        self.assertEqual(Enrollment.objects.count(), 1)
+
+    def test_existing_student_is_reused_not_duplicated(self):
+        asha = Student.objects.create(full_name="Asha", phone="9876543210")
+        result = self.run_import("ASHA,9876543210,,NEET Evening,", commit=True)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["new_students"], 0)
+        self.assertEqual(result["existing_students_matched"], 1)
+        self.assertEqual(Student.objects.count(), 1)
+        self.assertEqual(asha.enrollments.get().batch, self.neet)
+
+    def test_same_new_student_in_two_batches_is_created_once(self):
+        result = self.run_import(
+            "Asha,9876543210,,JEE Morning,",
+            "Asha,9876543210,,NEET Evening,",
+            commit=True,
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["new_students"], 1)
+        self.assertEqual(result["new_enrollments"], 2)
+        self.assertEqual(Student.objects.count(), 1)
+        self.assertEqual(Enrollment.objects.count(), 2)
+
+    def test_ambiguous_existing_student_is_rejected(self):
+        Student.objects.create(full_name="Asha", phone="9876543210")
+        Student.objects.create(full_name="Asha", phone="9876543210")
+        result = self.run_import("Asha,9876543210,,JEE Morning,")
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["field"], "full_name")
+
+    def test_missing_required_column_rejects_whole_file(self):
+        with self.assertRaises(ImportFileError):
+            self.run_import("Asha,JEE Morning", header="full_name,batch")
+
+    def test_empty_or_header_only_file_is_rejected(self):
+        with self.assertRaises(ImportFileError):
+            import_students(raw=b"", commit=False)
+        with self.assertRaises(ImportFileError):
+            self.run_import()  # header only, no data rows
+
+    def test_non_utf8_file_is_rejected(self):
+        with self.assertRaises(ImportFileError):
+            import_students(raw=b"\xff\xfe full_name,phone,batch", commit=False)
+
+    def test_excel_bom_is_accepted(self):
+        raw = ("\ufeff" + self.HEADER + "\nAsha,9876543210,,JEE Morning,").encode("utf-8")
+        result = import_students(raw=raw, commit=True)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(Student.objects.count(), 1)
+
+    def test_too_many_rows_is_rejected(self):
+        lines = [f"S{i},{9000000000 + i},,JEE Morning," for i in range(1001)]
+        with self.assertRaises(ImportFileError):
+            self.run_import(*lines)
+
+
+class ImportApiTests(TestCase):
+    CSV = (
+        "full_name,phone,guardian_name,batch,joined_on\n"
+        "Asha Rao,9876543210,Mr Rao,JEE Morning,2026-06-15\n"
+        "Ravi Kumar,9123456780,,JEE Morning,\n"
+    )
+
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher = mk("tea", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        Batch.objects.create(
+            name="JEE Morning", teacher=self.teacher, start_date=date(2026, 6, 1)
+        )
+        self.api = APIClient()
+        self.url = reverse("import-students")
+
+    def upload(self, user, content=None, commit="false"):
+        self.api.force_authenticate(user=user)
+        data = {"commit": commit}
+        if content is not None:
+            data["file"] = SimpleUploadedFile(
+                "students.csv", content, content_type="text/csv"
+            )
+        return self.api.post(self.url, data, format="multipart")
+
+    def test_owner_preview_saves_nothing(self):
+        response = self.upload(self.owner, self.CSV.encode())
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["committed"])
+        self.assertEqual(response.data["new_students"], 2)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_owner_commit_saves(self):
+        response = self.upload(self.owner, self.CSV.encode(), commit="true")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["committed"])
+        self.assertEqual(Student.objects.count(), 2)
+        self.assertEqual(Enrollment.objects.count(), 2)
+
+    def test_teacher_and_parent_are_forbidden(self):
+        for user in (self.teacher, self.parent):
+            response = self.upload(user, self.CSV.encode(), commit="true")
+            self.assertEqual(response.status_code, 403)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_row_errors_return_400_and_save_nothing(self):
+        bad = self.CSV + "Meera,9000000001,,No Such Batch,\n"
+        response = self.upload(self.owner, bad.encode(), commit="true")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["errors"][0]["row"], 4)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_missing_file_returns_400(self):
+        self.assertEqual(self.upload(self.owner).status_code, 400)
+
+    def test_unreadable_file_returns_400(self):
+        response = self.upload(self.owner, b"name,batch\nAsha,JEE Morning\n")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Missing column", str(response.data["detail"]))
+
+    def test_oversized_file_returns_400(self):
+        big = b"full_name,phone,batch\n" + b"x" * 1_000_001
+        self.assertEqual(self.upload(self.owner, big).status_code, 400)
