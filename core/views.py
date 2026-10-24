@@ -6,19 +6,30 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import AttendanceRecord, Enrollment, User
-from .selectors import batches_for, fee_plans_for, ledger_entries_for, students_for
+from .selectors import (
+    batches_for,
+    enrollments_for,
+    fee_plans_for,
+    ledger_entries_for,
+    students_for,
+)
+
 from .serializers import (
     AttendanceSheetInputSerializer,
     BatchSerializer,
     DuesRowSerializer,
+    FeePlanInputSerializer,
+    FeePlanSerializer,
     LedgerEntrySerializer,
     PaymentInputSerializer,
     ReverseInputSerializer,
     StudentSerializer,
 )
+
 from .services import (
     AttendanceError,
     LedgerError,
+    create_fee_plan,
     dues_report,
     mark_attendance,
     record_payment,
@@ -224,3 +235,46 @@ class PaymentViewSet(
         except LedgerError as error:
             raise ValidationError({"detail": str(error)})
         return Response(LedgerEntrySerializer(reversal).data, status=201)
+
+# ---- Fee plans ------------------------------------------------------------
+
+
+class FeePlanViewSet(
+    mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet
+):
+    def get_permissions(self):
+        if self.action == "create":
+            return [permissions.IsAuthenticated(), IsOwner()]
+        return [permissions.IsAuthenticated(), HasFeeAccess()]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return FeePlanInputSerializer
+        return FeePlanSerializer
+
+    def get_queryset(self):
+        return (
+            fee_plans_for(self.request.user)
+            .select_related("enrollment__student", "enrollment__batch")
+            .prefetch_related("installments")
+            .order_by("-id")
+        )
+
+    def create(self, request, *args, **kwargs):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        data = body.validated_data
+
+        enrollment = enrollments_for(request.user).filter(pk=data["enrollment"]).first()
+        if enrollment is None:
+            raise NotFound("Enrollment not found.")
+
+        try:
+            plan = create_fee_plan(
+                enrollment=enrollment,
+                total_amount=data["total_amount"],
+                due_dates=data["due_dates"],
+            )
+        except LedgerError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(FeePlanSerializer(plan).data, status=201)

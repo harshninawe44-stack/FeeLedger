@@ -15,6 +15,7 @@ from .models import (
     LedgerEntry,
     Student,
     User,
+    Installment
 )
 
 from .services import (
@@ -27,6 +28,7 @@ from .services import (
     record_payment,
     reverse_payment,
     split_amount,
+    create_fee_plan
 )
 
 from django.contrib.auth.models import AnonymousUser
@@ -890,3 +892,187 @@ class ApiWriteTests(TestCase):
         change = AttendanceChange.objects.order_by("id").last()
         self.assertEqual((change.old_status, change.new_status), ("absent", "late"))
         self.assertEqual(change.changed_by, self.teacher_a)
+
+class FeePlanServiceTests(TestCase):
+    def setUp(self):
+        teacher = User.objects.create_user(
+            "t_fp", password="pw", role=User.Role.TEACHER
+        )
+        batch = Batch.objects.create(
+            name="FP", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+        self.student = Student.objects.create(full_name="Meera")
+        self.enrollment = Enrollment.objects.create(
+            student=self.student, batch=batch, joined_on=date(2026, 6, 1)
+        )
+        self.dues = [date(2026, 7, 1), date(2026, 8, 1), date(2026, 9, 1)]
+
+    def test_creates_plan_with_installments_summing_to_total(self):
+        plan = create_fee_plan(
+            enrollment=self.enrollment, total_amount="10000.00", due_dates=self.dues
+        )
+        rows = list(plan.installments.order_by("number"))
+        self.assertEqual(plan.total_amount, Decimal("10000.00"))
+        self.assertEqual([r.number for r in rows], [1, 2, 3])
+        self.assertEqual([r.due_date for r in rows], self.dues)
+        self.assertEqual(sum(r.amount for r in rows), Decimal("10000.00"))
+
+    def test_earliest_installment_gets_the_extra_paisa(self):
+        plan = create_fee_plan(
+            enrollment=self.enrollment,
+            total_amount="10000.00",
+            due_dates=list(reversed(self.dues)),  # given out of order
+        )
+        first = plan.installments.get(number=1)
+        self.assertEqual(first.due_date, date(2026, 7, 1))
+        self.assertEqual(first.amount, Decimal("3333.34"))
+
+    def test_requires_at_least_one_due_date(self):
+        with self.assertRaises(LedgerError):
+            create_fee_plan(
+                enrollment=self.enrollment, total_amount="100.00", due_dates=[]
+            )
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+    def test_second_plan_for_same_enrollment_is_rejected(self):
+        create_fee_plan(
+            enrollment=self.enrollment, total_amount="100.00", due_dates=self.dues
+        )
+        with self.assertRaises(LedgerError):
+            create_fee_plan(
+                enrollment=self.enrollment, total_amount="200.00", due_dates=self.dues
+            )
+        self.assertEqual(FeePlan.objects.count(), 1)
+
+    def test_inactive_enrollment_is_rejected(self):
+        self.enrollment.is_active = False
+        self.enrollment.save()
+        with self.assertRaises(LedgerError):
+            create_fee_plan(
+                enrollment=self.enrollment, total_amount="100.00", due_dates=self.dues
+            )
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+    def test_zero_total_saves_nothing(self):
+        with self.assertRaises(LedgerError):
+            create_fee_plan(
+                enrollment=self.enrollment, total_amount="0.00", due_dates=self.dues
+            )
+        self.assertEqual(FeePlan.objects.count(), 0)
+        self.assertEqual(Installment.objects.count(), 0)
+
+
+class FeePlanApiTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher = mk("tea", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        self.parent_b = mk("pb", password="pw", role=User.Role.STUDENT)
+        self.batch = Batch.objects.create(
+            name="A", teacher=self.teacher, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.bala = Student.objects.create(full_name="Bala", user=self.parent_b)
+        self.enr_a = Enrollment.objects.create(
+            student=self.asha, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        self.enr_b = Enrollment.objects.create(
+            student=self.bala, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        self.api = APIClient()
+
+    def get(self, user, url):
+        self.api.force_authenticate(user=user)
+        return self.api.get(url)
+
+    def post(self, user, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(reverse("feeplan-list"), body, format="json")
+
+    def body(self, enrollment=None, total="10000.00", dues=None):
+        return {
+            "enrollment": (enrollment or self.enr_a).pk,
+            "total_amount": total,
+            "due_dates": dues
+            if dues is not None
+            else ["2026-11-01", "2026-12-01", "2027-01-01"],
+        }
+
+    def test_owner_creates_plan_with_exact_installments(self):
+        response = self.post(self.owner, self.body())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["total_amount"], "10000.00")
+        amounts = [i["amount"] for i in response.data["installments"]]
+        self.assertEqual(amounts, ["3333.34", "3333.33", "3333.33"])
+        self.assertEqual(FeePlan.objects.count(), 1)
+        self.assertEqual(Installment.objects.count(), 3)
+
+    def test_teacher_and_parent_cannot_create_plans(self):
+        for user in (self.teacher, self.parent_a):
+            response = self.post(user, self.body())
+            self.assertEqual(response.status_code, 403)
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+    def test_unknown_enrollment_returns_404(self):
+        body = self.body()
+        body["enrollment"] = 99999
+        self.assertEqual(self.post(self.owner, body).status_code, 404)
+
+    def test_second_plan_for_same_enrollment_returns_400(self):
+        self.assertEqual(self.post(self.owner, self.body()).status_code, 201)
+        self.assertEqual(self.post(self.owner, self.body()).status_code, 400)
+        self.assertEqual(FeePlan.objects.count(), 1)
+
+    def test_bad_totals_return_400(self):
+        for total in ["0.00", "-1.00", "100.005", "abc", "100000000.00"]:
+            response = self.post(self.owner, self.body(total=total))
+            self.assertEqual(response.status_code, 400, total)
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+    def test_missing_or_empty_due_dates_return_400(self):
+        self.assertEqual(self.post(self.owner, self.body(dues=[])).status_code, 400)
+        body = self.body()
+        del body["due_dates"]
+        self.assertEqual(self.post(self.owner, body).status_code, 400)
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+    def test_parent_sees_only_own_plan(self):
+        plan_a = create_fee_plan(
+            enrollment=self.enr_a, total_amount="1000.00", due_dates=[date(2026, 11, 1)]
+        )
+        plan_b = create_fee_plan(
+            enrollment=self.enr_b, total_amount="2000.00", due_dates=[date(2026, 11, 1)]
+        )
+        response = self.get(self.parent_a, reverse("feeplan-list"))
+        self.assertEqual([p["student"] for p in response.data["results"]], ["Asha"])
+        url = reverse("feeplan-detail", args=[plan_b.pk])
+        self.assertEqual(self.get(self.parent_a, url).status_code, 404)
+        url = reverse("feeplan-detail", args=[plan_a.pk])
+        self.assertEqual(self.get(self.parent_a, url).status_code, 200)
+
+    def test_teacher_is_forbidden_from_fee_plans(self):
+        response = self.get(self.teacher, reverse("feeplan-list"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_fee_plan_list_query_count_does_not_grow(self):
+        create_fee_plan(
+            enrollment=self.enr_a, total_amount="1000.00",
+            due_dates=[date(2026, 11, 1), date(2026, 12, 1)],
+        )
+        url = reverse("feeplan-list")
+        self.api.force_authenticate(user=self.owner)
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(url)
+        for i in range(5):
+            student = Student.objects.create(full_name=f"Extra {i}")
+            enr = Enrollment.objects.create(
+                student=student, batch=self.batch, joined_on=date(2026, 6, 1)
+            )
+            create_fee_plan(
+                enrollment=enr, total_amount="1000.00",
+                due_dates=[date(2026, 11, 1), date(2026, 12, 1)],
+            )
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(url)
+        self.assertEqual(len(before), len(after))

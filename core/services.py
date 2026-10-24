@@ -239,3 +239,30 @@ def mark_attendance(*, batch, date, statuses, marked_by, today=None):
     ]
     AttendanceChange.objects.bulk_create(changes)
     return session
+
+@transaction.atomic
+def create_fee_plan(*, enrollment, total_amount, due_dates):
+    """Create a fee plan and split it into installments, all or nothing."""
+    if not due_dates:
+        raise LedgerError("At least one due date is needed.")
+
+    # Lock the enrollment so two simultaneous requests can't both create a plan.
+    enrollment = Enrollment.objects.select_for_update().get(pk=enrollment.pk)
+    if not enrollment.is_active:
+        raise LedgerError("This enrollment is not active.")
+    if FeePlan.objects.filter(enrollment=enrollment).exists():
+        raise LedgerError("This enrollment already has a fee plan.")
+
+    due_dates = sorted(due_dates)  # earliest first, so it gets any extra paisa
+    amounts = split_amount(total_amount, len(due_dates))  # validates the total
+
+    plan = FeePlan.objects.create(
+        enrollment=enrollment, total_amount=Decimal(total_amount)
+    )
+    Installment.objects.bulk_create(
+        [
+            Installment(fee_plan=plan, number=i + 1, amount=amount, due_date=due)
+            for i, (amount, due) in enumerate(zip(amounts, due_dates))
+        ]
+    )
+    return plan

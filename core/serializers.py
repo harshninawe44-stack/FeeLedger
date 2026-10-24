@@ -2,8 +2,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from .models import AttendanceRecord, Batch, LedgerEntry, Student
-
+from .models import AttendanceRecord, Batch, FeePlan, Installment, LedgerEntry, Student
 
 class BatchSerializer(serializers.ModelSerializer):
     teacher_name = serializers.CharField(source="teacher.username", read_only=True)
@@ -82,3 +81,38 @@ class AttendanceRecordInputSerializer(serializers.Serializer):
 class AttendanceSheetInputSerializer(serializers.Serializer):
     date = serializers.DateField()
     records = AttendanceRecordInputSerializer(many=True)
+
+# ---- Fee plans ------------------------------------------------------------
+
+
+class InstallmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Installment
+        fields = ["number", "amount", "due_date"]
+        read_only_fields = fields
+
+
+class FeePlanSerializer(serializers.ModelSerializer):
+    student = serializers.CharField(
+        source="enrollment.student.full_name", read_only=True
+    )
+    batch = serializers.CharField(source="enrollment.batch.name", read_only=True)
+    installments = InstallmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = FeePlan
+        fields = [
+            "id", "enrollment", "student", "batch",
+            "total_amount", "installments", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class FeePlanInputSerializer(serializers.Serializer):
+    enrollment = serializers.IntegerField()
+    total_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.01")
+    )
+    due_dates = serializers.ListField(
+        child=serializers.DateField(), min_length=1, max_length=24
+    )
