@@ -1,11 +1,32 @@
-from rest_framework import generics, permissions, viewsets
+from django.utils import timezone
+from rest_framework import generics, mixins, permissions, serializers, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import User
-from .selectors import batches_for, fee_plans_for, students_for
-from .serializers import BatchSerializer, DuesRowSerializer, StudentSerializer
-from .services import dues_report
+from .models import AttendanceRecord, Enrollment, User
+from .selectors import batches_for, fee_plans_for, ledger_entries_for, students_for
+from .serializers import (
+    AttendanceSheetInputSerializer,
+    BatchSerializer,
+    DuesRowSerializer,
+    LedgerEntrySerializer,
+    PaymentInputSerializer,
+    ReverseInputSerializer,
+    StudentSerializer,
+)
+from .services import (
+    AttendanceError,
+    LedgerError,
+    dues_report,
+    mark_attendance,
+    record_payment,
+    reverse_payment,
+)
+
+
+# ---- Permissions ----------------------------------------------------------
 
 
 class HasFeeAccess(permissions.BasePermission):
@@ -20,19 +41,30 @@ class HasFeeAccess(permissions.BasePermission):
         )
 
 
-class MeView(APIView):
-    def get(self, request):
-        user = request.user
-        return Response(
-            {"id": user.id, "username": user.username, "role": user.role}
+class IsOwner(permissions.BasePermission):
+    message = "Only the owner can do this."
+
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role == User.Role.OWNER
+
+
+class IsOwnerOrTeacher(permissions.BasePermission):
+    message = "Only owners and teachers can do this."
+
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role in (
+            User.Role.OWNER,
+            User.Role.TEACHER,
         )
 
 
-class BatchViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = BatchSerializer
+# ---- Read-only endpoints --------------------------------------------------
 
-    def get_queryset(self):
-        return batches_for(self.request.user).select_related("teacher").order_by("name")
+
+class MeView(APIView):
+    def get(self, request):
+        user = request.user
+        return Response({"id": user.id, "username": user.username, "role": user.role})
 
 
 class StudentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -48,3 +80,147 @@ class DuesView(generics.ListAPIView):
 
     def get_queryset(self):
         return dues_report(fee_plans=fee_plans_for(self.request.user))
+
+
+# ---- Attendance helpers ---------------------------------------------------
+
+
+def _query_date(request):
+    value = request.query_params.get("date")
+    if not value:
+        return timezone.localdate()
+    return serializers.DateField().run_validation(value)  # 400 if malformed
+
+
+def _attendance_sheet(batch, day):
+    """The roster for one batch and date, with each student's status (or None)."""
+    enrollments = (
+        Enrollment.objects.filter(batch=batch, is_active=True)
+        .select_related("student")
+        .order_by("student__full_name")
+    )
+    statuses = dict(
+        AttendanceRecord.objects.filter(
+            session__batch=batch, session__date=day
+        ).values_list("student_id", "status")
+    )
+    return {
+        "batch": batch.pk,
+        "date": day,
+        "records": [
+            {
+                "student": e.student_id,
+                "student_name": e.student.full_name,
+                "status": statuses.get(e.student_id),
+            }
+            for e in enrollments
+        ],
+    }
+
+
+class BatchViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = BatchSerializer
+
+    def get_queryset(self):
+        return batches_for(self.request.user).select_related("teacher").order_by("name")
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path="attendance",
+        permission_classes=[permissions.IsAuthenticated, IsOwnerOrTeacher],
+        serializer_class=AttendanceSheetInputSerializer,
+    )
+    def attendance(self, request, pk=None):
+        batch = self.get_object()  # scoped: 404 if this isn't the user's batch
+
+        if request.method == "GET":
+            return Response(_attendance_sheet(batch, _query_date(request)))
+
+        body = AttendanceSheetInputSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        day = body.validated_data["date"]
+        records = body.validated_data["records"]
+
+        statuses = {r["student"]: r["status"] for r in records}
+        if len(statuses) != len(records):
+            raise ValidationError({"detail": "Each student can appear only once."})
+
+        try:
+            mark_attendance(
+                batch=batch, date=day, statuses=statuses, marked_by=request.user
+            )
+        except AttendanceError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(_attendance_sheet(batch, day))
+
+
+# ---- Payments -------------------------------------------------------------
+
+
+class PaymentViewSet(
+    mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet
+):
+    """Read the ledger, record a payment, reverse a payment.
+    There is no update or delete: the ledger is append-only."""
+
+    def get_permissions(self):
+        if self.action in ("create", "reverse"):
+            return [permissions.IsAuthenticated(), IsOwner()]
+        return [permissions.IsAuthenticated(), HasFeeAccess()]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return PaymentInputSerializer
+        if self.action == "reverse":
+            return ReverseInputSerializer
+        return LedgerEntrySerializer
+
+    def get_queryset(self):
+        queryset = (
+            ledger_entries_for(self.request.user)
+            .select_related("fee_plan__enrollment__student", "received_by")
+            .order_by("-paid_on", "-id")
+        )
+        fee_plan = self.request.query_params.get("fee_plan")
+        if fee_plan and fee_plan.isdigit():
+            queryset = queryset.filter(fee_plan_id=fee_plan)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        data = body.validated_data
+
+        plan = fee_plans_for(request.user).filter(pk=data["fee_plan"]).first()
+        if plan is None:
+            raise NotFound("Fee plan not found.")
+
+        try:
+            entry = record_payment(
+                fee_plan=plan,
+                amount=data["amount"],
+                method=data["method"],
+                paid_on=data["paid_on"],
+                received_by=request.user,
+                reference=data["reference"],
+                note=data["note"],
+            )
+        except LedgerError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(LedgerEntrySerializer(entry).data, status=201)
+
+    @action(detail=True, methods=["post"])
+    def reverse(self, request, pk=None):
+        entry = self.get_object()  # scoped: 404 if the entry isn't visible to you
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        try:
+            reversal = reverse_payment(
+                entry=entry,
+                reason=body.validated_data["reason"],
+                received_by=request.user,
+            )
+        except LedgerError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(LedgerEntrySerializer(reversal).data, status=201)

@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -151,3 +152,8 @@ REST_FRAMEWORK = {
 }
 
 LOGIN_REDIRECT_URL = "/api/"
+
+if "test" in sys.argv:
+    # Real passwords are hashed slowly on purpose. Tests create many users,
+    # so use a fast hasher, but only when running `manage.py test`.
+    PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]

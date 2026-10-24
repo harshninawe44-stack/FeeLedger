@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, timedelta
+from django.utils import timezone
 from decimal import Decimal
 
 from django.db import DatabaseError, IntegrityError, transaction
@@ -628,3 +629,264 @@ class ApiTests(TestCase):
         self.api.force_authenticate(user=self.owner)
         response = self.api.post(reverse("batch-list"), {"name": "Hacked"})
         self.assertEqual(response.status_code, 405)
+
+class ApiWriteTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        self.parent_b = mk("pb", password="pw", role=User.Role.STUDENT)
+
+        self.batch_a = Batch.objects.create(
+            name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        self.batch_b = Batch.objects.create(
+            name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.ravi = Student.objects.create(full_name="Ravi")
+        self.bala = Student.objects.create(full_name="Bala", user=self.parent_b)
+        enr_asha = Enrollment.objects.create(
+            student=self.asha, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        Enrollment.objects.create(
+            student=self.ravi, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        enr_bala = Enrollment.objects.create(
+            student=self.bala, batch=self.batch_b, joined_on=date(2026, 6, 1)
+        )
+        self.plan_a = FeePlan.objects.create(
+            enrollment=enr_asha, total_amount=Decimal("10000.00")
+        )
+        self.plan_b = FeePlan.objects.create(
+            enrollment=enr_bala, total_amount=Decimal("10000.00")
+        )
+        self.today = timezone.localdate()
+        self.api = APIClient()
+
+    # ---- helpers ----
+    def get(self, user, url):
+        self.api.force_authenticate(user=user)
+        return self.api.get(url)
+
+    def post(self, user, url, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(url, body, format="json")
+
+    def make_payment(self, plan=None, amount="1000.00"):
+        return record_payment(
+            fee_plan=plan or self.plan_a,
+            amount=Decimal(amount),
+            method="cash",
+            paid_on=date(2026, 10, 1),
+            received_by=self.owner,
+        )
+
+    def payment_body(self, amount, plan=None):
+        return {
+            "fee_plan": (plan or self.plan_a).pk,
+            "amount": amount,
+            "method": "cash",
+            "paid_on": "2026-10-01",
+        }
+
+    def sheet_body(self, day=None, ravi="absent"):
+        return {
+            "date": str(day or self.today),
+            "records": [
+                {"student": self.asha.pk, "status": "present"},
+                {"student": self.ravi.pk, "status": ravi},
+            ],
+        }
+
+    def attendance_url(self, batch=None):
+        return reverse("batch-attendance", args=[(batch or self.batch_a).pk])
+
+    # ---- payments ----
+    def test_owner_records_a_payment(self):
+        response = self.post(
+            self.owner, reverse("payment-list"), self.payment_body("1000.00")
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["amount"], "1000.00")
+        self.assertEqual(response.data["kind"], "payment")
+        self.assertEqual(LedgerEntry.objects.count(), 1)
+        self.assertEqual(LedgerEntry.objects.get().received_by, self.owner)
+
+    def test_teacher_cannot_record_a_payment(self):
+        response = self.post(
+            self.teacher_a, reverse("payment-list"), self.payment_body("1000.00")
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(LedgerEntry.objects.count(), 0)
+
+    def test_parent_cannot_record_a_payment(self):
+        response = self.post(
+            self.parent_a, reverse("payment-list"), self.payment_body("1000.00")
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(LedgerEntry.objects.count(), 0)
+
+    def test_overpayment_returns_400(self):
+        response = self.post(
+            self.owner, reverse("payment-list"), self.payment_body("10000.01")
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(LedgerEntry.objects.count(), 0)
+
+    def test_bad_amounts_return_400(self):
+        for amount in ["0.00", "-5.00", "100.005", "abc"]:
+            response = self.post(
+                self.owner, reverse("payment-list"), self.payment_body(amount)
+            )
+            self.assertEqual(response.status_code, 400, amount)
+        self.assertEqual(LedgerEntry.objects.count(), 0)
+
+    def test_unknown_fee_plan_returns_404(self):
+        body = self.payment_body("100.00")
+        body["fee_plan"] = 99999
+        response = self.post(self.owner, reverse("payment-list"), body)
+        self.assertEqual(response.status_code, 404)
+
+    def test_owner_reverses_a_payment(self):
+        entry = self.make_payment(amount="1000.00")
+        response = self.post(
+            self.owner,
+            reverse("payment-reverse", args=[entry.pk]),
+            {"reason": "Entered wrong student"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["kind"], "reversal")
+        self.assertEqual(response.data["amount"], "-1000.00")
+        self.assertEqual(response.data["reverses"], entry.pk)
+        self.assertEqual(net_paid(self.plan_a), Decimal("0.00"))
+
+    def test_payment_cannot_be_reversed_twice(self):
+        entry = self.make_payment()
+        url = reverse("payment-reverse", args=[entry.pk])
+        self.assertEqual(self.post(self.owner, url, {"reason": "x"}).status_code, 201)
+        self.assertEqual(self.post(self.owner, url, {"reason": "y"}).status_code, 400)
+        self.assertEqual(LedgerEntry.objects.count(), 2)
+
+    def test_reversal_needs_a_reason(self):
+        entry = self.make_payment()
+        url = reverse("payment-reverse", args=[entry.pk])
+        for reason in ["", "   "]:
+            response = self.post(self.owner, url, {"reason": reason})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(LedgerEntry.objects.count(), 1)
+
+    def test_teacher_and_parent_cannot_reverse(self):
+        entry = self.make_payment()
+        url = reverse("payment-reverse", args=[entry.pk])
+        self.assertEqual(self.post(self.teacher_a, url, {"reason": "x"}).status_code, 403)
+        self.assertEqual(self.post(self.parent_a, url, {"reason": "x"}).status_code, 403)
+        self.assertEqual(LedgerEntry.objects.count(), 1)
+
+    def test_parent_sees_only_own_payments(self):
+        mine = self.make_payment(self.plan_a)
+        self.make_payment(self.plan_b)
+        response = self.get(self.parent_a, reverse("payment-list"))
+        self.assertEqual([r["id"] for r in response.data["results"]], [mine.pk])
+
+    def test_teacher_is_forbidden_from_payments(self):
+        self.make_payment()
+        response = self.get(self.teacher_a, reverse("payment-list"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_payments_cannot_be_edited_or_deleted_through_the_api(self):
+        entry = self.make_payment()
+        url = reverse("payment-detail", args=[entry.pk])
+        self.api.force_authenticate(user=self.owner)
+        self.assertEqual(self.api.patch(url, {"amount": "1.00"}, format="json").status_code, 405)
+        self.assertEqual(self.api.put(url, {"amount": "1.00"}, format="json").status_code, 405)
+        self.assertEqual(self.api.delete(url).status_code, 405)
+        entry.refresh_from_db()
+        self.assertEqual(entry.amount, Decimal("1000.00"))
+
+    def test_payment_list_query_count_does_not_grow(self):
+        self.make_payment()
+        url = reverse("payment-list")
+        self.api.force_authenticate(user=self.owner)
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(url)
+        for _ in range(5):
+            self.make_payment(amount="10.00")
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(url)
+        self.assertEqual(len(before), len(after))
+
+    # ---- attendance ----
+    def test_teacher_reads_own_batch_sheet(self):
+        response = self.get(self.teacher_a, self.attendance_url())
+        self.assertEqual(response.status_code, 200)
+        names = [r["student_name"] for r in response.data["records"]]
+        self.assertEqual(names, ["Asha", "Ravi"])
+        self.assertTrue(all(r["status"] is None for r in response.data["records"]))
+
+    def test_teacher_submits_attendance(self):
+        response = self.post(self.teacher_a, self.attendance_url(), self.sheet_body())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(AttendanceSession.objects.count(), 1)
+        self.assertEqual(AttendanceRecord.objects.get(student=self.asha).status, "present")
+        self.assertEqual(AttendanceRecord.objects.get(student=self.ravi).status, "absent")
+        statuses = [r["status"] for r in response.data["records"]]
+        self.assertEqual(statuses, ["present", "absent"])
+
+    def test_teacher_gets_404_for_another_teachers_batch_attendance(self):
+        self.assertEqual(self.get(self.teacher_b, self.attendance_url()).status_code, 404)
+        response = self.post(self.teacher_b, self.attendance_url(), self.sheet_body())
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_parent_cannot_use_attendance_endpoint(self):
+        self.assertEqual(self.get(self.parent_a, self.attendance_url()).status_code, 403)
+        response = self.post(self.parent_a, self.attendance_url(), self.sheet_body())
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_incomplete_sheet_returns_400(self):
+        body = {
+            "date": str(self.today),
+            "records": [{"student": self.asha.pk, "status": "present"}],
+        }
+        response = self.post(self.teacher_a, self.attendance_url(), body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_duplicate_student_returns_400(self):
+        body = {
+            "date": str(self.today),
+            "records": [
+                {"student": self.asha.pk, "status": "present"},
+                {"student": self.asha.pk, "status": "absent"},
+            ],
+        }
+        response = self.post(self.teacher_a, self.attendance_url(), body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_unknown_status_returns_400(self):
+        response = self.post(
+            self.teacher_a, self.attendance_url(), self.sheet_body(ravi="sleeping")
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_future_date_returns_400(self):
+        tomorrow = self.today + timedelta(days=1)
+        response = self.post(
+            self.teacher_a, self.attendance_url(), self.sheet_body(day=tomorrow)
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AttendanceSession.objects.count(), 0)
+
+    def test_editing_attendance_logs_the_change(self):
+        self.post(self.teacher_a, self.attendance_url(), self.sheet_body())
+        self.post(self.teacher_a, self.attendance_url(), self.sheet_body(ravi="late"))
+        self.assertEqual(AttendanceChange.objects.count(), 3)  # 2 first marks + 1 edit
+        change = AttendanceChange.objects.order_by("id").last()
+        self.assertEqual((change.old_status, change.new_status), ("absent", "late"))
+        self.assertEqual(change.changed_by, self.teacher_a)

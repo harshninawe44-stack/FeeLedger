@@ -1,6 +1,8 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
-from .models import Batch, Student
+from .models import AttendanceRecord, Batch, LedgerEntry, Student
 
 
 class BatchSerializer(serializers.ModelSerializer):
@@ -27,3 +29,56 @@ class DuesRowSerializer(serializers.Serializer):
     due_so_far = serializers.DecimalField(max_digits=12, decimal_places=2)
     overdue = serializers.DecimalField(max_digits=12, decimal_places=2)
     balance = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+# ---- Payments -------------------------------------------------------------
+
+
+class LedgerEntrySerializer(serializers.ModelSerializer):
+    """What the API SHOWS for a ledger entry. Everything is read-only."""
+
+    student = serializers.CharField(
+        source="fee_plan.enrollment.student.full_name", read_only=True
+    )
+    received_by_name = serializers.CharField(
+        source="received_by.username", read_only=True
+    )
+
+    class Meta:
+        model = LedgerEntry
+        fields = [
+            "id", "fee_plan", "student", "kind", "amount", "method",
+            "reference", "note", "paid_on", "reverses",
+            "received_by", "received_by_name", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class PaymentInputSerializer(serializers.Serializer):
+    """What the API ACCEPTS when recording a payment."""
+
+    fee_plan = serializers.IntegerField()
+    amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.01")
+    )
+    method = serializers.ChoiceField(choices=LedgerEntry.Method.choices)
+    paid_on = serializers.DateField()
+    reference = serializers.CharField(required=False, allow_blank=True, max_length=100, default="")
+    note = serializers.CharField(required=False, allow_blank=True, max_length=255, default="")
+
+
+class ReverseInputSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=255)
+
+
+# ---- Attendance -----------------------------------------------------------
+
+
+class AttendanceRecordInputSerializer(serializers.Serializer):
+    student = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=AttendanceRecord.Status.choices)
+
+
+class AttendanceSheetInputSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    records = AttendanceRecordInputSerializer(many=True)
