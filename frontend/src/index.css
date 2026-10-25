@@ -1,0 +1,53 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #1f2933;
+  background: #f4f6f8;
+}
+body {
+  margin: 0;
+}
+.center {
+  text-align: center;
+  margin-top: 4rem;
+}
+.error {
+  color: #b42318;
+}
+.login {
+  max-width: 320px;
+  margin: 5rem auto;
+  padding: 2rem;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+.login label {
+  display: block;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.login input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem;
+  margin-top: 0.25rem;
+}
+button {
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}
+.topbar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.75rem 1.5rem;
+  background: #fff;
+  border-bottom: 1px solid #d9dee3;
+}
+.topbar span {
+  margin-left: auto;
+}
+main {
+  padding: 1.5rem;
+}
