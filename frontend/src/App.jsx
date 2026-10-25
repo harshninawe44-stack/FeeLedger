@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import Login from './Login'
+import Dues from './Dues'
 
 const ROLE_LABELS = {
   owner: 'Owner',
@@ -8,10 +9,15 @@ const ROLE_LABELS = {
   student: 'Student / Parent',
 }
 
+// Which screens exist and which roles may see them. This only decides what to
+// SHOW. The real protection is in Django, which refuses anyone not allowed.
+const PAGES = [{ id: 'dues', label: 'Fees', roles: ['owner', 'student'] }]
+
 export default function App() {
   const [status, setStatus] = useState('loading') // 'loading' | 'ready' | 'error'
   const [user, setUser] = useState(null)
   const [error, setError] = useState('')
+  const [activeId, setActiveId] = useState('dues')
 
   // Runs once when the page opens: get the CSRF cookie, then ask "who am I?"
   useEffect(() => {
@@ -47,10 +53,24 @@ export default function App() {
   if (!user) return <Login onLoggedIn={setUser} />
 
   const roleLabel = ROLE_LABELS[user.role] ?? user.role
+  const pages = PAGES.filter((page) => page.roles.includes(user.role))
+  const active = pages.find((page) => page.id === activeId) ?? pages[0]
+
   return (
     <div>
       <header className="topbar">
         <strong>FeeLedger</strong>
+        <nav>
+          {pages.map((page) => (
+            <button
+              key={page.id}
+              className={page === active ? 'active' : ''}
+              onClick={() => setActiveId(page.id)}
+            >
+              {page.label}
+            </button>
+          ))}
+        </nav>
         <span>
           {user.username} · {roleLabel}
         </span>
@@ -58,8 +78,12 @@ export default function App() {
       </header>
       {error && <p className="error">{error}</p>}
       <main>
-        <h1>Welcome, {user.username}</h1>
-        <p>You are signed in as {roleLabel}. The dashboard comes next.</p>
+        {!active && (
+          <p className="empty">
+            There are no screens for your role yet. Attendance is coming soon.
+          </p>
+        )}
+        {active?.id === 'dues' && <Dues role={user.role} />}
       </main>
     </div>
   )
