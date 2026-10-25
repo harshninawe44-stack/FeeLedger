@@ -2,6 +2,8 @@ from datetime import date, timedelta
 from django.utils import timezone
 from decimal import Decimal
 
+from django.core.cache import cache
+
 from django.core.files.uploadedfile import SimpleUploadedFile
 
 from .importers import ImportFileError, import_students
@@ -1329,3 +1331,94 @@ class ImportApiTests(TestCase):
     def test_oversized_file_returns_400(self):
         big = b"full_name,phone,batch\n" + b"x" * 1_000_001
         self.assertEqual(self.upload(self.owner, big).status_code, 400)
+
+class AuthApiTests(TestCase):
+    def setUp(self):
+        cache.clear()  # the login rate limit counts requests in the cache
+        self.user = User.objects.create_user(
+            "owner_x", password="correct-horse", role=User.Role.OWNER
+        )
+        self.api = APIClient()
+        self.login_url = reverse("auth-login")
+
+    def login(self, username="owner_x", password="correct-horse", client=None, **extra):
+        client = client or self.api
+        return client.post(
+            self.login_url,
+            {"username": username, "password": password},
+            format="json",
+            **extra,
+        )
+
+    def test_csrf_endpoint_sets_the_cookie(self):
+        response = self.api.get(reverse("auth-csrf"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("csrftoken", response.cookies)
+
+    def test_login_works_and_starts_a_session(self):
+        self.assertEqual(self.api.get(reverse("me")).status_code, 403)
+        response = self.login()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["username"], "owner_x")
+        self.assertEqual(response.data["role"], "owner")
+        self.assertEqual(self.api.get(reverse("me")).status_code, 200)
+
+    def test_wrong_password_is_rejected(self):
+        response = self.login(password="nope")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.api.get(reverse("me")).status_code, 403)
+
+    def test_unknown_user_gets_the_same_message_as_wrong_password(self):
+        ghost = self.login(username="ghost", password="x")
+        wrong = self.login(password="nope")
+        self.assertEqual(ghost.status_code, 400)
+        self.assertEqual(wrong.status_code, 400)
+        self.assertEqual(ghost.data, wrong.data)
+
+    def test_inactive_user_cannot_log_in(self):
+        self.user.is_active = False
+        self.user.save()
+        self.assertEqual(self.login().status_code, 400)
+
+    def test_missing_fields_return_400(self):
+        self.assertEqual(self.api.post(self.login_url, {}, format="json").status_code, 400)
+        response = self.api.post(
+            self.login_url, {"username": "owner_x"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_logout_ends_the_session(self):
+        self.login()
+        self.assertEqual(self.api.post(reverse("auth-logout")).status_code, 204)
+        self.assertEqual(self.api.get(reverse("me")).status_code, 403)
+
+    def test_logout_when_nobody_is_logged_in_is_harmless(self):
+        self.assertEqual(self.api.post(reverse("auth-logout")).status_code, 204)
+
+    def test_login_needs_a_csrf_token(self):
+        strict = APIClient(enforce_csrf_checks=True)
+        self.assertEqual(self.login(client=strict).status_code, 403)
+        strict.get(reverse("auth-csrf"))
+        token = strict.cookies["csrftoken"].value
+        response = self.login(client=strict, HTTP_X_CSRFTOKEN=token)
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_logged_in_post_needs_a_csrf_token(self):
+        strict = APIClient(enforce_csrf_checks=True)
+        strict.get(reverse("auth-csrf"))
+        self.login(client=strict, HTTP_X_CSRFTOKEN=strict.cookies["csrftoken"].value)
+
+        logout_url = reverse("auth-logout")
+        self.assertEqual(strict.post(logout_url).status_code, 403)  # no token
+        self.assertEqual(strict.get(reverse("me")).status_code, 200)  # still in
+
+        fresh_token = strict.cookies["csrftoken"].value  # login rotated it
+        response = strict.post(logout_url, HTTP_X_CSRFTOKEN=fresh_token)
+        self.assertEqual(response.status_code, 204)
+
+    def test_login_is_rate_limited(self):
+        for _ in range(10):
+            self.assertEqual(self.login(password="nope").status_code, 400)
+        self.assertEqual(self.login(password="nope").status_code, 429)
+        # even the correct password is refused until the limit resets
+        self.assertEqual(self.login().status_code, 429)

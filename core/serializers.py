@@ -123,3 +123,11 @@ class FeePlanInputSerializer(serializers.Serializer):
 class ImportUploadSerializer(serializers.Serializer):
     file = serializers.FileField()
     commit = serializers.BooleanField(default=False)
+
+# ---- Login ----------------------------------------------------------------
+
+
+class LoginSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=150)
+    # trim_whitespace=False: spaces at the ends of a password are part of it.
+    password = serializers.CharField(max_length=128, trim_whitespace=False)

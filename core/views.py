@@ -5,6 +5,11 @@ from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.contrib.auth import authenticate, login, logout
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
+from rest_framework.throttling import ScopedRateThrottle
+
 from rest_framework.parsers import MultiPartParser
 
 from .importers import MAX_BYTES, ImportFileError, import_students
@@ -28,7 +33,8 @@ from .serializers import (
     PaymentInputSerializer,
     ReverseInputSerializer,
     StudentSerializer,
-    ImportUploadSerializer
+    ImportUploadSerializer,
+    LoginSerializer
 )
 
 from .services import (
@@ -309,3 +315,44 @@ class ImportStudentsView(generics.GenericAPIView):
         if result["errors"]:
             return Response(result, status=400)
         return Response(result, status=201 if result["committed"] else 200)
+
+# ---- Login and logout -----------------------------------------------------
+
+
+@method_decorator(ensure_csrf_cookie, name="dispatch")
+class CsrfView(APIView):
+    """Visiting this address makes Django set the csrftoken cookie."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return Response({"detail": "CSRF cookie set."})
+
+
+# DRF views skip Django's CSRF check by default. For login we switch it back on.
+@method_decorator(csrf_protect, name="dispatch")
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"  # the rate comes from DEFAULT_THROTTLE_RATES
+
+    def post(self, request):
+        body = LoginSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        user = authenticate(
+            request,
+            username=body.validated_data["username"],
+            password=body.validated_data["password"],
+        )
+        if user is None:  # also covers inactive accounts
+            raise ValidationError({"detail": "Wrong username or password."})
+        login(request, user)  # starts the session
+        return Response({"id": user.id, "username": user.username, "role": user.role})
+
+
+class LogoutView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        logout(request)  # safe to call even if nobody is logged in
+        return Response(status=204)
