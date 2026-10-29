@@ -1422,3 +1422,76 @@ class AuthApiTests(TestCase):
         self.assertEqual(self.login(password="nope").status_code, 429)
         # even the correct password is refused until the limit resets
         self.assertEqual(self.login().status_code, 429)
+
+class DetailSupportTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        teacher = mk("tea", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        batch = Batch.objects.create(
+            name="A", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.bala = Student.objects.create(full_name="Bala")
+        enr_a = Enrollment.objects.create(
+            student=self.asha, batch=batch, joined_on=date(2026, 6, 1)
+        )
+        enr_b = Enrollment.objects.create(
+            student=self.bala, batch=batch, joined_on=date(2026, 6, 1)
+        )
+        self.plan_a = create_fee_plan(
+            enrollment=enr_a, total_amount="10000.00", due_dates=[date(2026, 7, 1)]
+        )
+        self.plan_b = create_fee_plan(
+            enrollment=enr_b, total_amount="20000.00", due_dates=[date(2026, 7, 1)]
+        )
+        self.api = APIClient()
+        self.api.force_authenticate(user=self.owner)
+
+    def pay(self, plan, amount):
+        return record_payment(
+            fee_plan=plan, amount=Decimal(amount), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.owner,
+        )
+
+    def test_reversed_payment_is_flagged(self):
+        kept = self.pay(self.plan_a, "1000.00")
+        wrong = self.pay(self.plan_a, "2000.00")
+        reversal = reverse_payment(
+            entry=wrong, reason="Mistake", received_by=self.owner
+        )
+        response = self.api.get(reverse("payment-list"), {"fee_plan": self.plan_a.pk})
+        flags = {row["id"]: row["is_reversed"] for row in response.data["results"]}
+        self.assertEqual(flags, {kept.pk: False, wrong.pk: True, reversal.pk: False})
+
+    def test_new_payment_response_says_not_reversed(self):
+        response = self.api.post(
+            reverse("payment-list"),
+            {
+                "fee_plan": self.plan_a.pk,
+                "amount": "500.00",
+                "method": "cash",
+                "paid_on": "2026-10-01",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(response.data["is_reversed"], False)
+
+    def test_dues_can_be_filtered_to_one_plan(self):
+        response = self.api.get(reverse("dues"), {"fee_plan": self.plan_b.pk})
+        ids = [row["fee_plan_id"] for row in response.data["results"]]
+        self.assertEqual(ids, [self.plan_b.pk])
+
+    def test_dues_filter_cannot_expose_another_familys_plan(self):
+        self.api.force_authenticate(user=self.parent_a)
+        response = self.api.get(reverse("dues"), {"fee_plan": self.plan_b.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["results"], [])
+
+    def test_odd_digit_filters_do_not_crash(self):
+        for value in ["²", "٣", "9" * 40, "abc", "-1", ""]:
+            for name in ("dues", "payment-list"):
+                response = self.api.get(reverse(name), {"fee_plan": value})
+                self.assertEqual(response.status_code, 200, (name, value))

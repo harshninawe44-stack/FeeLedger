@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import Login from './Login'
 import Dues from './Dues'
+import PlanDetail from './PlanDetail'
 
 const ROLE_LABELS = {
   owner: 'Owner',
@@ -18,6 +19,7 @@ export default function App() {
   const [user, setUser] = useState(null)
   const [error, setError] = useState('')
   const [activeId, setActiveId] = useState('dues')
+  const [planId, setPlanId] = useState(null) // which fee plan is open, if any
 
   // Runs once when the page opens: get the CSRF cookie, then ask "who am I?"
   useEffect(() => {
@@ -42,6 +44,7 @@ export default function App() {
     try {
       await api('/auth/logout/', { method: 'POST' })
       setUser(null)
+      setPlanId(null)
       setError('')
     } catch (err) {
       setError(err.message)
@@ -65,7 +68,10 @@ export default function App() {
             <button
               key={page.id}
               className={page === active ? 'active' : ''}
-              onClick={() => setActiveId(page.id)}
+              onClick={() => {
+                setActiveId(page.id)
+                setPlanId(null)
+              }}
             >
               {page.label}
             </button>
@@ -83,7 +89,12 @@ export default function App() {
             There are no screens for your role yet. Attendance is coming soon.
           </p>
         )}
-        {active?.id === 'dues' && <Dues role={user.role} />}
+        {active?.id === 'dues' &&
+          (planId === null ? (
+            <Dues role={user.role} onOpen={setPlanId} />
+          ) : (
+            <PlanDetail planId={planId} role={user.role} onBack={() => setPlanId(null)} />
+          ))}
       </main>
     </div>
   )

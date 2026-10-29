@@ -42,16 +42,27 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     received_by_name = serializers.CharField(
         source="received_by.username", read_only=True
     )
+    is_reversed = serializers.SerializerMethodField()
 
     class Meta:
         model = LedgerEntry
         fields = [
             "id", "fee_plan", "student", "kind", "amount", "method",
-            "reference", "note", "paid_on", "reverses",
+            "reference", "note", "paid_on", "reverses", "is_reversed",
             "received_by", "received_by_name", "created_at",
         ]
         read_only_fields = fields
 
+    def get_is_reversed(self, obj):
+        # The payment list marks every row in one query. A freshly created
+        # entry has no mark yet, so for that one row we ask the database.
+        flagged = getattr(obj, "is_reversed", None)
+        if flagged is not None:
+            return flagged
+        return (
+            obj.kind == LedgerEntry.Kind.PAYMENT
+            and LedgerEntry.objects.filter(reverses=obj).exists()
+        )
 
 class PaymentInputSerializer(serializers.Serializer):
     """What the API ACCEPTS when recording a payment."""
@@ -131,3 +142,14 @@ class LoginSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
     # trim_whitespace=False: spaces at the ends of a password are part of it.
     password = serializers.CharField(max_length=128, trim_whitespace=False)
+
+    def get_is_reversed(self, obj):
+        # The payment list marks every row in one query. A freshly created
+        # entry has no mark yet, so for that one row we ask the database.
+        flagged = getattr(obj, "is_reversed", None)
+        if flagged is not None:
+            return flagged
+        return (
+            obj.kind == LedgerEntry.Kind.PAYMENT
+            and LedgerEntry.objects.filter(reverses=obj).exists()
+        )

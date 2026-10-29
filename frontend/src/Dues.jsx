@@ -4,7 +4,7 @@ import { formatRupees, isZeroMoney } from './money'
 
 const PAGE_SIZE = 50 // must match PAGE_SIZE in Django's settings
 
-export default function Dues({ role }) {
+export default function Dues({ role, onOpen}) {
   const [page, setPage] = useState(1)
   // Holds the answer for one page: { page, result } or { page, error }.
   const [loaded, setLoaded] = useState(null)
@@ -56,7 +56,11 @@ export default function Dues({ role }) {
             <tbody>
               {results.map((row) => (
                 <tr key={row.fee_plan_id}>
-                  <td>{row.student}</td>
+                  <td>
+                    <button className="link" onClick={() => onOpen(row.fee_plan_id)}>
+                    {row.student}
+                    </button>
+                  </td>
                   <td>{row.batch}</td>
                   <td className="num">{formatRupees(row.total_amount)}</td>
                   <td className="num">{formatRupees(row.paid)}</td>

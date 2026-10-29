@@ -4,6 +4,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.db.models import Exists, OuterRef
 
 from django.contrib.auth import authenticate, login, logout
 from django.utils.decorators import method_decorator
@@ -14,7 +15,7 @@ from rest_framework.parsers import MultiPartParser
 
 from .importers import MAX_BYTES, ImportFileError, import_students
 
-from .models import AttendanceRecord, Enrollment, User
+from .models import AttendanceRecord, Enrollment, LedgerEntry, User
 from .selectors import (
     batches_for,
     enrollments_for,
@@ -47,6 +48,11 @@ from .services import (
     reverse_payment,
 )
 
+def _digits(value):
+    """The value as a number if it is plain ASCII digits, otherwise None."""
+    if value and len(value) <= 18 and value.isascii() and value.isdigit():
+        return int(value)
+    return None
 
 # ---- Permissions ----------------------------------------------------------
 
@@ -101,7 +107,11 @@ class DuesView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated, HasFeeAccess]
 
     def get_queryset(self):
-        return dues_report(fee_plans=fee_plans_for(self.request.user))
+        plans = fee_plans_for(self.request.user)
+        fee_plan = _digits(self.request.query_params.get("fee_plan"))
+        if fee_plan is not None:
+            plans = plans.filter(pk=fee_plan)
+        return dues_report(fee_plans=plans)
 
 
 # ---- Attendance helpers ---------------------------------------------------
@@ -202,10 +212,15 @@ class PaymentViewSet(
         queryset = (
             ledger_entries_for(self.request.user)
             .select_related("fee_plan__enrollment__student", "received_by")
+            .annotate(
+                is_reversed=Exists(
+                    LedgerEntry.objects.filter(reverses=OuterRef("pk"))
+                )
+            )
             .order_by("-paid_on", "-id")
         )
-        fee_plan = self.request.query_params.get("fee_plan")
-        if fee_plan and fee_plan.isdigit():
+        fee_plan = _digits(self.request.query_params.get("fee_plan"))
+        if fee_plan is not None:
             queryset = queryset.filter(fee_plan_id=fee_plan)
         return queryset
 
