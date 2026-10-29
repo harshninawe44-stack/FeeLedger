@@ -3,6 +3,7 @@ import { api, ApiError } from './api'
 import Login from './Login'
 import Dues from './Dues'
 import PlanDetail from './PlanDetail'
+import Attendance from './Attendance'
 
 const ROLE_LABELS = {
   owner: 'Owner',
@@ -12,7 +13,10 @@ const ROLE_LABELS = {
 
 // Which screens exist and which roles may see them. This only decides what to
 // SHOW. The real protection is in Django, which refuses anyone not allowed.
-const PAGES = [{ id: 'dues', label: 'Fees', roles: ['owner', 'student'] }]
+const PAGES = [
+  { id: 'dues', label: 'Fees', roles: ['owner', 'student'] },
+  { id: 'attendance', label: 'Attendance', roles: ['owner', 'teacher'] },
+]
 
 export default function App() {
   const [status, setStatus] = useState('loading') // 'loading' | 'ready' | 'error'
@@ -84,17 +88,14 @@ export default function App() {
       </header>
       {error && <p className="error">{error}</p>}
       <main>
-        {!active && (
-          <p className="empty">
-            There are no screens for your role yet. Attendance is coming soon.
-          </p>
-        )}
+        {!active && <p className="empty">There are no screens for your role yet.</p>}
         {active?.id === 'dues' &&
           (planId === null ? (
             <Dues role={user.role} onOpen={setPlanId} />
           ) : (
             <PlanDetail planId={planId} role={user.role} onBack={() => setPlanId(null)} />
           ))}
+        {active?.id === 'attendance' && <Attendance role={user.role} />}
       </main>
     </div>
   )
