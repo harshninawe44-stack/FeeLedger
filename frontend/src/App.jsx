@@ -4,6 +4,8 @@ import Login from './Login'
 import Dues from './Dues'
 import PlanDetail from './PlanDetail'
 import Attendance from './Attendance'
+import NewFeePlan from './NewFeePlan'
+import ImportStudents from './ImportStudents'
 
 const ROLE_LABELS = {
   owner: 'Owner',
@@ -16,6 +18,8 @@ const ROLE_LABELS = {
 const PAGES = [
   { id: 'dues', label: 'Fees', roles: ['owner', 'student'] },
   { id: 'attendance', label: 'Attendance', roles: ['owner', 'teacher'] },
+  { id: 'newplan', label: 'New fee plan', roles: ['owner'] },
+  { id: 'import', label: 'Import students', roles: ['owner'] },
 ]
 
 export default function App() {
@@ -53,6 +57,12 @@ export default function App() {
     } catch (err) {
       setError(err.message)
     }
+  }
+
+  // Jump straight to one fee plan (used after creating it).
+  function openPlan(id) {
+    setActiveId('dues')
+    setPlanId(id)
   }
 
   if (status === 'loading') return <p className="center">Loading…</p>
@@ -96,6 +106,8 @@ export default function App() {
             <PlanDetail planId={planId} role={user.role} onBack={() => setPlanId(null)} />
           ))}
         {active?.id === 'attendance' && <Attendance role={user.role} />}
+        {active?.id === 'newplan' && <NewFeePlan onCreated={openPlan} />}
+        {active?.id === 'import' && <ImportStudents />}
       </main>
     </div>
   )

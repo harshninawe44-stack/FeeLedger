@@ -5,6 +5,7 @@ from .views import (
     BatchViewSet,
     CsrfView,
     DuesView,
+    EnrollmentViewSet,
     FeePlanViewSet,
     ImportStudentsView,
     LoginView,
@@ -19,6 +20,7 @@ router.register("batches", BatchViewSet, basename="batch")
 router.register("students", StudentViewSet, basename="student")
 router.register("payments", PaymentViewSet, basename="payment")
 router.register("fee-plans", FeePlanViewSet, basename="feeplan")
+router.register("enrollments", EnrollmentViewSet, basename="enrollment")
 
 urlpatterns = [
     path("auth/csrf/", CsrfView.as_view(), name="auth-csrf"),

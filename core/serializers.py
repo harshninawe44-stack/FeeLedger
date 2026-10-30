@@ -2,7 +2,15 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from .models import AttendanceRecord, Batch, FeePlan, Installment, LedgerEntry, Student
+from .models import (
+    AttendanceRecord,
+    Batch,
+    Enrollment,
+    FeePlan,
+    Installment,
+    LedgerEntry,
+    Student,
+)
 
 class BatchSerializer(serializers.ModelSerializer):
     teacher_name = serializers.CharField(source="teacher.username", read_only=True)
@@ -153,3 +161,34 @@ class LoginSerializer(serializers.Serializer):
             obj.kind == LedgerEntry.Kind.PAYMENT
             and LedgerEntry.objects.filter(reverses=obj).exists()
         )
+
+# ---- Owner screens --------------------------------------------------------
+
+
+class EnrollmentSerializer(serializers.ModelSerializer):
+    student_name = serializers.CharField(source="student.full_name", read_only=True)
+    batch_name = serializers.CharField(source="batch.name", read_only=True)
+    has_fee_plan = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Enrollment
+        fields = [
+            "id", "student", "student_name", "batch", "batch_name",
+            "joined_on", "is_active", "has_fee_plan",
+        ]
+        read_only_fields = fields
+
+
+class FeePlanPreviewInputSerializer(serializers.Serializer):
+    total_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.01")
+    )
+    due_dates = serializers.ListField(
+        child=serializers.DateField(), min_length=1, max_length=24
+    )
+
+
+class InstallmentPreviewSerializer(serializers.Serializer):
+    number = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    due_date = serializers.DateField()

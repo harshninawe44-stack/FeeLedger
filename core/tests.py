@@ -27,14 +27,15 @@ from .models import (
 from .services import (
     AttendanceError,
     LedgerError,
+    create_fee_plan,
     create_installments,
     dues_report,
     mark_attendance,
     net_paid,
+    preview_installments,
     record_payment,
     reverse_payment,
     split_amount,
-    create_fee_plan
 )
 
 from django.contrib.auth.models import AnonymousUser
@@ -190,7 +191,7 @@ class InstallmentTests(TestCase):
         self.assertEqual(split_amount("60000.00", 4), [Decimal("15000.00")] * 4)
 
     def test_split_always_adds_up_to_the_total(self):
-        for total in ["0.01", "1.00", "99.99", "10000.00", "59999.99", "123456.78"]:
+        for total in ["0.12", "1.00", "99.99", "10000.00", "59999.99", "123456.78"]:
             for parts in range(1, 13):
                 amounts = split_amount(total, parts)
                 self.assertEqual(len(amounts), parts)
@@ -1495,3 +1496,177 @@ class DetailSupportTests(TestCase):
             for name in ("dues", "payment-list"):
                 response = self.api.get(reverse(name), {"fee_plan": value})
                 self.assertEqual(response.status_code, 200, (name, value))
+
+class SplitSafetyTests(TestCase):
+    def test_total_too_small_to_split_is_rejected(self):
+        with self.assertRaises(LedgerError):
+            split_amount("0.01", 2)
+        self.assertEqual(split_amount("0.01", 1), [Decimal("0.01")])
+        self.assertEqual(
+            split_amount("0.02", 2), [Decimal("0.01"), Decimal("0.01")]
+        )
+
+    def test_every_installment_is_at_least_one_paisa(self):
+        for total in ["0.12", "0.13", "1.00", "10000.00"]:
+            for parts in range(1, 13):
+                amounts = split_amount(total, parts)
+                self.assertTrue(all(a >= Decimal("0.01") for a in amounts))
+                self.assertEqual(sum(amounts), Decimal(total))
+
+    def test_duplicate_due_dates_are_rejected(self):
+        with self.assertRaises(LedgerError):
+            preview_installments(
+                total_amount="100.00",
+                due_dates=[date(2026, 7, 1), date(2026, 7, 1)],
+            )
+
+    def test_preview_sorts_dates_and_saves_nothing(self):
+        rows = preview_installments(
+            total_amount="10000.00",
+            due_dates=[date(2026, 9, 1), date(2026, 7, 1), date(2026, 8, 1)],
+        )
+        self.assertEqual([r["number"] for r in rows], [1, 2, 3])
+        self.assertEqual(
+            [r["due_date"] for r in rows],
+            [date(2026, 7, 1), date(2026, 8, 1), date(2026, 9, 1)],
+        )
+        self.assertEqual(
+            [r["amount"] for r in rows],
+            [Decimal("3333.34"), Decimal("3333.33"), Decimal("3333.33")],
+        )
+        self.assertEqual(FeePlan.objects.count(), 0)
+
+
+class OwnerScreensApiTests(TestCase):
+    DUES = ["2026-12-01", "2026-10-01", "2026-11-01"]  # deliberately unordered
+
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher = mk("tea", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        self.batch = Batch.objects.create(
+            name="A", teacher=self.teacher, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha Rao")
+        self.bala = Student.objects.create(full_name="Bala Singh")
+        self.chetan = Student.objects.create(full_name="Chetan Das")
+        self.enr_asha = Enrollment.objects.create(
+            student=self.asha, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        self.enr_bala = Enrollment.objects.create(
+            student=self.bala, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        self.enr_chetan = Enrollment.objects.create(
+            student=self.chetan, batch=self.batch,
+            joined_on=date(2026, 6, 1), is_active=False,
+        )
+        create_fee_plan(
+            enrollment=self.enr_bala,
+            total_amount="1000.00",
+            due_dates=[date(2026, 11, 1)],
+        )
+        self.api = APIClient()
+
+    def post(self, user, name, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(reverse(name), body, format="json")
+
+    def get(self, user, params=None):
+        self.api.force_authenticate(user=user)
+        return self.api.get(reverse("enrollment-list"), params or {})
+
+    def names(self, params):
+        response = self.get(self.owner, params)
+        return [row["student_name"] for row in response.data["results"]]
+
+    def test_preview_returns_exact_split_and_saves_nothing(self):
+        before = FeePlan.objects.count()
+        response = self.post(
+            self.owner,
+            "feeplan-preview",
+            {"total_amount": "10000.00", "due_dates": self.DUES},
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = response.data["installments"]
+        self.assertEqual([r["amount"] for r in rows], ["3333.34", "3333.33", "3333.33"])
+        self.assertEqual(
+            [r["due_date"] for r in rows], ["2026-10-01", "2026-11-01", "2026-12-01"]
+        )
+        self.assertEqual(FeePlan.objects.count(), before)
+
+    def test_preview_matches_what_create_saves(self):
+        body = {"total_amount": "10000.00", "due_dates": self.DUES}
+        preview = self.post(self.owner, "feeplan-preview", body).data["installments"]
+        created = self.post(
+            self.owner, "feeplan-list", {**body, "enrollment": self.enr_asha.pk}
+        )
+        self.assertEqual(created.status_code, 201)
+        keys = ("number", "amount", "due_date")
+        shown = [{k: row[k] for k in keys} for row in preview]
+        saved = [{k: row[k] for k in keys} for row in created.data["installments"]]
+        self.assertEqual(saved, shown)
+
+    def test_preview_is_owner_only(self):
+        body = {"total_amount": "100.00", "due_dates": self.DUES}
+        for user in (self.teacher, self.parent):
+            self.assertEqual(self.post(user, "feeplan-preview", body).status_code, 403)
+
+    def test_preview_rejects_bad_input(self):
+        cases = [
+            {"total_amount": "0.00", "due_dates": self.DUES},
+            {"total_amount": "100.005", "due_dates": self.DUES},
+            {"total_amount": "abc", "due_dates": self.DUES},
+            {"total_amount": "100.00", "due_dates": []},
+            {"total_amount": "100.00", "due_dates": ["2026-10-01", "2026-10-01"]},
+            {"total_amount": "0.01", "due_dates": ["2026-10-01", "2026-11-01"]},
+            {"due_dates": self.DUES},
+            {"total_amount": "100.00"},
+        ]
+        for body in cases:
+            response = self.post(self.owner, "feeplan-preview", body)
+            self.assertEqual(response.status_code, 400, body)
+
+    def test_create_with_total_too_small_to_split_returns_400(self):
+        body = {
+            "enrollment": self.enr_asha.pk,
+            "total_amount": "0.01",
+            "due_dates": self.DUES,
+        }
+        response = self.post(self.owner, "feeplan-list", body)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(FeePlan.objects.filter(enrollment=self.enr_asha).exists())
+
+    def test_enrollments_are_owner_only(self):
+        for user in (self.teacher, self.parent):
+            self.assertEqual(self.get(user).status_code, 403)
+
+    def test_enrollment_filters(self):
+        rows = self.get(self.owner).data["results"]
+        flags = {row["student_name"]: row["has_fee_plan"] for row in rows}
+        self.assertEqual(
+            flags, {"Asha Rao": False, "Bala Singh": True, "Chetan Das": False}
+        )
+        self.assertEqual(self.names({"without_plan": "1"}), ["Asha Rao", "Chetan Das"])
+        self.assertEqual(self.names({"without_plan": "1", "active": "1"}), ["Asha Rao"])
+        self.assertEqual(self.names({"search": "bala"}), ["Bala Singh"])
+        self.assertEqual(
+            self.names({"search": "  "}), ["Asha Rao", "Bala Singh", "Chetan Das"]
+        )
+
+    def test_enrollment_list_query_count_does_not_grow(self):
+        url = reverse("enrollment-list")
+        self.api.force_authenticate(user=self.owner)
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(url)
+        for i in range(5):
+            student = Student.objects.create(full_name=f"Extra {i}")
+            Enrollment.objects.create(
+                student=student, batch=self.batch, joined_on=date(2026, 6, 1)
+            )
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(url)
+        self.assertEqual(len(before), len(after))
+
+    def test_very_long_search_does_not_crash(self):
+        self.assertEqual(self.get(self.owner, {"search": "x" * 500}).status_code, 200)

@@ -1,21 +1,18 @@
+from django.contrib.auth import authenticate, login, logout
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from rest_framework import generics, mixins, permissions, serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from django.db.models import Exists, OuterRef
-
-from django.contrib.auth import authenticate, login, logout
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
-from rest_framework.throttling import ScopedRateThrottle
-
 from rest_framework.parsers import MultiPartParser
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
 
 from .importers import MAX_BYTES, ImportFileError, import_students
-
-from .models import AttendanceRecord, Enrollment, LedgerEntry, User
+from .models import AttendanceRecord, Enrollment, FeePlan, LedgerEntry, User
 from .selectors import (
     batches_for,
     enrollments_for,
@@ -23,27 +20,29 @@ from .selectors import (
     ledger_entries_for,
     students_for,
 )
-
 from .serializers import (
     AttendanceSheetInputSerializer,
     BatchSerializer,
     DuesRowSerializer,
+    EnrollmentSerializer,
     FeePlanInputSerializer,
+    FeePlanPreviewInputSerializer,
     FeePlanSerializer,
+    ImportUploadSerializer,
+    InstallmentPreviewSerializer,
     LedgerEntrySerializer,
+    LoginSerializer,
     PaymentInputSerializer,
     ReverseInputSerializer,
     StudentSerializer,
-    ImportUploadSerializer,
-    LoginSerializer
 )
-
 from .services import (
     AttendanceError,
     LedgerError,
     create_fee_plan,
     dues_report,
     mark_attendance,
+    preview_installments,
     record_payment,
     reverse_payment,
 )
@@ -269,13 +268,15 @@ class FeePlanViewSet(
     mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet
 ):
     def get_permissions(self):
-        if self.action == "create":
+        if self.action in ("create", "preview"):
             return [permissions.IsAuthenticated(), IsOwner()]
         return [permissions.IsAuthenticated(), HasFeeAccess()]
 
     def get_serializer_class(self):
         if self.action == "create":
             return FeePlanInputSerializer
+        if self.action == "preview":
+            return FeePlanPreviewInputSerializer
         return FeePlanSerializer
 
     def get_queryset(self):
@@ -304,6 +305,23 @@ class FeePlanViewSet(
         except LedgerError as error:
             raise ValidationError({"detail": str(error)})
         return Response(FeePlanSerializer(plan).data, status=201)
+
+    @action(detail=False, methods=["post"])
+    def preview(self, request):
+        """Show how a total would be split. Saves nothing."""
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        try:
+            rows = preview_installments(
+                total_amount=body.validated_data["total_amount"],
+                due_dates=body.validated_data["due_dates"],
+            )
+        except LedgerError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(
+            {"installments": InstallmentPreviewSerializer(rows, many=True).data}
+        )
+
 
 # ---- CSV import -----------------------------------------------------------
 
@@ -371,3 +389,34 @@ class LogoutView(APIView):
     def post(self, request):
         logout(request)  # safe to call even if nobody is logged in
         return Response(status=204)
+
+# ---- Enrollments (owner screens) ------------------------------------------
+
+
+class EnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
+    """Lets the owner pick who needs a fee plan. Filters: ?without_plan=1,
+    ?active=1 and ?search=name."""
+
+    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    serializer_class = EnrollmentSerializer
+
+    def get_queryset(self):
+        queryset = (
+            enrollments_for(self.request.user)
+            .select_related("student", "batch")
+            .annotate(
+                has_fee_plan=Exists(
+                    FeePlan.objects.filter(enrollment=OuterRef("pk"))
+                )
+            )
+            .order_by("student__full_name", "id")
+        )
+        params = self.request.query_params
+        if params.get("without_plan") == "1":
+            queryset = queryset.filter(has_fee_plan=False)
+        if params.get("active") == "1":
+            queryset = queryset.filter(is_active=True)
+        search = params.get("search", "").strip()
+        if search:
+            queryset = queryset.filter(student__full_name__icontains=search[:100])
+        return queryset

@@ -97,6 +97,10 @@ def split_amount(total, parts):
         raise LedgerError("Total can have at most 2 decimal places.")
 
     paise = int(total.scaleb(2))  # 10000.00 rupees -> 1000000 paise
+    if paise < parts:
+        raise LedgerError(
+            "The total is too small to split into that many installments."
+        )
     base, leftover = divmod(paise, parts)
     # The first `leftover` installments each get one extra paisa.
     amounts = [base + 1 if i < leftover else base for i in range(parts)]
@@ -241,10 +245,25 @@ def mark_attendance(*, batch, date, statuses, marked_by, today=None):
     return session
 
 @transaction.atomic
-def create_fee_plan(*, enrollment, total_amount, due_dates):
-    """Create a fee plan and split it into installments, all or nothing."""
+
+def preview_installments(*, total_amount, due_dates):
+    """Work out the installments for a plan without saving anything."""
     if not due_dates:
         raise LedgerError("At least one due date is needed.")
+    if len(set(due_dates)) != len(due_dates):
+        raise LedgerError("Each due date can appear only once.")
+    due_dates = sorted(due_dates)  # earliest first, so it gets any extra paisa
+    amounts = split_amount(total_amount, len(due_dates))  # validates the total
+    return [
+        {"number": i + 1, "amount": amount, "due_date": due}
+        for i, (amount, due) in enumerate(zip(amounts, due_dates))
+    ]
+
+
+@transaction.atomic
+def create_fee_plan(*, enrollment, total_amount, due_dates):
+    """Create a fee plan and split it into installments, all or nothing."""
+    rows = preview_installments(total_amount=total_amount, due_dates=due_dates)
 
     # Lock the enrollment so two simultaneous requests can't both create a plan.
     enrollment = Enrollment.objects.select_for_update().get(pk=enrollment.pk)
@@ -253,16 +272,18 @@ def create_fee_plan(*, enrollment, total_amount, due_dates):
     if FeePlan.objects.filter(enrollment=enrollment).exists():
         raise LedgerError("This enrollment already has a fee plan.")
 
-    due_dates = sorted(due_dates)  # earliest first, so it gets any extra paisa
-    amounts = split_amount(total_amount, len(due_dates))  # validates the total
-
     plan = FeePlan.objects.create(
         enrollment=enrollment, total_amount=Decimal(total_amount)
     )
     Installment.objects.bulk_create(
         [
-            Installment(fee_plan=plan, number=i + 1, amount=amount, due_date=due)
-            for i, (amount, due) in enumerate(zip(amounts, due_dates))
+            Installment(
+                fee_plan=plan,
+                number=row["number"],
+                amount=row["amount"],
+                due_date=row["due_date"],
+            )
+            for row in rows
         ]
     )
     return plan
