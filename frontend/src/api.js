@@ -2,9 +2,10 @@
 // as the page, so the browser sends the login cookie automatically.
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, data = null) {
     super(message)
     this.status = status
+    this.data = data // the raw error body, for screens that need more detail
   }
 }
 
@@ -14,21 +15,26 @@ function getCookie(name) {
   return found ? decodeURIComponent(found.slice(prefix.length)) : null
 }
 
-// Django errors arrive in a few shapes. Turn any of them into one message.
+// Django errors arrive in a few shapes (text, lists, nested objects).
+// Collect every piece of text into one list.
+function flatten(value) {
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) return value.flatMap(flatten)
+  if (value && typeof value === 'object') return Object.values(value).flatMap(flatten)
+  return []
+}
+
 function messageFrom(data) {
-  if (!data || typeof data !== 'object') return 'Something went wrong.'
-  const detail = data.detail
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) return detail.join(' ')
-  const first = Object.values(data)[0]
-  if (Array.isArray(first)) return first.join(' ')
-  if (typeof first === 'string') return first
-  return 'Something went wrong.'
+  const source = data && typeof data === 'object' && 'detail' in data ? data.detail : data
+  const parts = flatten(source)
+  return parts.length ? parts.join(' ') : 'Something went wrong.'
 }
 
 export async function api(path, { method = 'GET', body } = {}) {
   const headers = { Accept: 'application/json' }
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const isForm = body instanceof FormData
+  // A file upload sets its own Content-Type (with a boundary), so we leave it out.
+  if (body !== undefined && !isForm) headers['Content-Type'] = 'application/json'
 
   // Anything that changes data must carry the CSRF token Django gave us.
   if (method !== 'GET') {
@@ -42,7 +48,7 @@ export async function api(path, { method = 'GET', body } = {}) {
       method,
       headers,
       credentials: 'same-origin',
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : isForm ? body : JSON.stringify(body),
     })
   } catch {
     throw new ApiError(0, 'Cannot reach the server. Is it running?')
@@ -56,6 +62,6 @@ export async function api(path, { method = 'GET', body } = {}) {
   } catch {
     // the response had no JSON body
   }
-  if (!response.ok) throw new ApiError(response.status, messageFrom(data))
+  if (!response.ok) throw new ApiError(response.status, messageFrom(data), data)
   return data
 }

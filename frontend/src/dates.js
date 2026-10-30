@@ -19,6 +19,17 @@ export function daysAgoIso(days) {
   return toIso(date)
 }
 
+// "2026-01-31" + 1 month -> "2026-02-28" (the day is clamped to the month's end)
+export function addMonthsIso(iso, months) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso ?? '')
+  if (!match) return ''
+  const monthIndex = Number(match[2]) - 1 + months
+  const year = Number(match[1]) + Math.floor(monthIndex / 12)
+  const month = ((monthIndex % 12) + 12) % 12
+  const lastDay = new Date(year, month + 1, 0).getDate()
+  return toIso(new Date(year, month, Math.min(Number(match[3]), lastDay)))
+}
+
 export function formatDate(iso) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso ?? '')
   if (!match) return '—'
