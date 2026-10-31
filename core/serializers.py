@@ -192,3 +192,19 @@ class InstallmentPreviewSerializer(serializers.Serializer):
     number = serializers.IntegerField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     due_date = serializers.DateField()
+
+# ---- Attendance (reading) -------------------------------------------------
+
+
+class AttendanceRecordSerializer(serializers.ModelSerializer):
+    student_name = serializers.CharField(source="student.full_name", read_only=True)
+    batch = serializers.IntegerField(source="session.batch_id", read_only=True)
+    batch_name = serializers.CharField(source="session.batch.name", read_only=True)
+    date = serializers.DateField(source="session.date", read_only=True)
+
+    class Meta:
+        model = AttendanceRecord
+        fields = [
+            "id", "student", "student_name", "batch", "batch_name", "date", "status",
+        ]
+        read_only_fields = fields

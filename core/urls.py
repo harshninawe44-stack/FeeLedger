@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AttendanceViewSet,
     BatchViewSet,
     CsrfView,
     DuesView,
@@ -21,6 +22,7 @@ router.register("students", StudentViewSet, basename="student")
 router.register("payments", PaymentViewSet, basename="payment")
 router.register("fee-plans", FeePlanViewSet, basename="feeplan")
 router.register("enrollments", EnrollmentViewSet, basename="enrollment")
+router.register("attendance", AttendanceViewSet, basename="attendance")
 
 urlpatterns = [
     path("auth/csrf/", CsrfView.as_view(), name="auth-csrf"),

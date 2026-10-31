@@ -1670,3 +1670,195 @@ class OwnerScreensApiTests(TestCase):
 
     def test_very_long_search_does_not_crash(self):
         self.assertEqual(self.get(self.owner, {"search": "x" * 500}).status_code, 200)
+
+class AttendanceReadApiTests(TestCase):
+    TODAY = date(2026, 10, 30)
+    D1, D2, D3 = date(2026, 10, 26), date(2026, 10, 27), date(2026, 10, 28)
+
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent_a = mk("pa", password="pw", role=User.Role.STUDENT)
+        self.parent_b = mk("pb", password="pw", role=User.Role.STUDENT)
+
+        self.batch_a = Batch.objects.create(
+            name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        self.batch_b = Batch.objects.create(
+            name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1)
+        )
+        self.asha = Student.objects.create(full_name="Asha", user=self.parent_a)
+        self.bala = Student.objects.create(full_name="Bala", user=self.parent_b)
+        # Asha is in both batches. Bala is only in batch B.
+        for student, batch in [
+            (self.asha, self.batch_a),
+            (self.asha, self.batch_b),
+            (self.bala, self.batch_b),
+        ]:
+            Enrollment.objects.create(
+                student=student, batch=batch, joined_on=date(2026, 6, 1)
+            )
+
+        a, b = self.asha.pk, self.bala.pk
+        self.mark(self.batch_a, self.D1, {a: "present"})
+        self.mark(self.batch_a, self.D2, {a: "absent"})
+        self.mark(self.batch_a, self.D3, {a: "late"})
+        self.mark(self.batch_b, self.D1, {a: "leave", b: "present"})
+        self.mark(self.batch_b, self.D2, {a: "present", b: "absent"})
+        self.api = APIClient()
+
+    # ---- helpers ----
+    def mark(self, batch, day, statuses):
+        return mark_attendance(
+            batch=batch, date=day, statuses=statuses,
+            marked_by=self.owner, today=self.TODAY,
+        )
+
+    def get(self, user, name, params=None):
+        self.api.force_authenticate(user=user)
+        return self.api.get(reverse(name), params or {})
+
+    def records(self, user, params=None):
+        response = self.get(user, "attendance-list", params)
+        self.assertEqual(response.status_code, 200)
+        return response.data["results"]
+
+    # ---- who can see what ----
+    def test_anonymous_user_is_rejected(self):
+        self.assertEqual(self.get(None, "attendance-list").status_code, 403)
+        self.assertEqual(self.get(None, "attendance-summary").status_code, 403)
+
+    def test_parent_sees_only_own_childs_records(self):
+        rows = self.records(self.parent_a)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({row["student_name"] for row in rows}, {"Asha"})
+
+    def test_other_parent_sees_only_own_records(self):
+        rows = self.records(self.parent_b)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["student_name"] for row in rows}, {"Bala"})
+
+    def test_teacher_sees_only_own_batch_records(self):
+        rows = self.records(self.teacher_a)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row["batch_name"] for row in rows}, {"A"})
+        rows = self.records(self.teacher_b)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row["batch_name"] for row in rows}, {"B"})
+
+    def test_owner_sees_everything(self):
+        self.assertEqual(len(self.records(self.owner)), 7)
+
+    def test_parent_cannot_reach_another_child_with_a_filter(self):
+        self.assertEqual(self.records(self.parent_a, {"student": self.bala.pk}), [])
+        self.assertEqual(self.records(self.parent_a, {"batch": 99999}), [])
+
+    # ---- filters ----
+    def test_filters_narrow_the_list(self):
+        self.assertEqual(len(self.records(self.owner, {"batch": self.batch_a.pk})), 3)
+        self.assertEqual(len(self.records(self.owner, {"student": self.bala.pk})), 2)
+        rows = self.records(self.parent_a, {"from": "2026-10-27", "to": "2026-10-27"})
+        self.assertEqual({row["status"] for row in rows}, {"absent", "present"})
+        self.assertEqual(len(rows), 2)
+        rows = self.records(self.owner, {"from": "2026-10-28"})
+        self.assertEqual(len(rows), 1)
+
+    def test_bad_date_filters_return_400(self):
+        for name in ("from", "to"):
+            for value in ["abc", "2026-13-45", "2026-02-31", "²"]:
+                response = self.get(self.owner, "attendance-list", {name: value})
+                self.assertEqual(response.status_code, 400, (name, value))
+
+    def test_bad_id_filters_do_not_crash(self):
+        for name in ("student", "batch"):
+            for value in ["²", "9" * 40, "abc", "-1", ""]:
+                response = self.get(self.owner, "attendance-list", {name: value})
+                self.assertEqual(response.status_code, 200, (name, value))
+
+    def test_list_is_newest_first_and_carries_names(self):
+        rows = self.records(self.owner)
+        dates = [row["date"] for row in rows]
+        self.assertEqual(dates, sorted(dates, reverse=True))
+        first = rows[0]
+        self.assertEqual(first["date"], "2026-10-28")
+        self.assertEqual(first["student_name"], "Asha")
+        self.assertEqual(first["batch_name"], "A")
+        self.assertEqual(first["batch"], self.batch_a.pk)
+        self.assertEqual(first["status"], "late")
+
+    # ---- summary ----
+    def test_summary_counts_and_percentage(self):
+        response = self.get(self.parent_a, "attendance-summary")
+        self.assertEqual(response.status_code, 200)
+        by_batch = {row["batch_name"]: row for row in response.data}
+        self.assertEqual(set(by_batch), {"A", "B"})
+
+        a = by_batch["A"]
+        self.assertEqual(a["student_name"], "Asha")
+        self.assertEqual(
+            (a["total"], a["present"], a["absent"], a["late"], a["leave"]),
+            (3, 1, 1, 1, 0),
+        )
+        self.assertEqual(a["percent"], 66.7)  # (present + late) / 3
+
+        b = by_batch["B"]
+        self.assertEqual(
+            (b["total"], b["present"], b["absent"], b["late"], b["leave"]),
+            (2, 1, 0, 0, 1),
+        )
+        self.assertEqual(b["percent"], 100.0)  # leave day is left out: 1 / 1
+
+    def test_summary_is_scoped(self):
+        rows = self.get(self.teacher_a, "attendance-summary").data
+        self.assertEqual([(r["student_name"], r["batch_name"]) for r in rows], [("Asha", "A")])
+
+        rows = self.get(self.parent_b, "attendance-summary").data
+        self.assertEqual([(r["student_name"], r["batch_name"]) for r in rows], [("Bala", "B")])
+        self.assertEqual(rows[0]["percent"], 50.0)
+
+        rows = self.get(self.owner, "attendance-summary").data
+        self.assertEqual(
+            [(r["student_name"], r["batch_name"]) for r in rows],
+            [("Asha", "A"), ("Asha", "B"), ("Bala", "B")],
+        )
+
+    def test_summary_percent_is_none_when_only_leave(self):
+        dev = Student.objects.create(full_name="Dev")
+        Enrollment.objects.create(
+            student=dev, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        self.mark(
+            self.batch_a, date(2026, 10, 19), {self.asha.pk: "present", dev.pk: "leave"}
+        )
+        rows = self.get(self.owner, "attendance-summary").data
+        dev_row = next(row for row in rows if row["student_name"] == "Dev")
+        self.assertEqual(dev_row["total"], 1)
+        self.assertIsNone(dev_row["percent"])
+
+    # ---- query counts and safety ----
+    def count_queries_growth(self, name):
+        self.api.force_authenticate(user=self.owner)
+        url = reverse(name)
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(url)
+        for i in range(5):
+            self.mark(self.batch_a, date(2026, 10, 20 + i), {self.asha.pk: "present"})
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(url)
+        return len(before), len(after)
+
+    def test_list_query_count_does_not_grow(self):
+        before, after = self.count_queries_growth("attendance-list")
+        self.assertEqual(before, after)
+
+    def test_summary_query_count_does_not_grow(self):
+        before, after = self.count_queries_growth("attendance-summary")
+        self.assertEqual(before, after)
+
+    def test_attendance_endpoints_are_read_only(self):
+        self.api.force_authenticate(user=self.owner)
+        for name in ("attendance-list", "attendance-summary"):
+            response = self.api.post(reverse(name), {"status": "present"}, format="json")
+            self.assertEqual(response.status_code, 405, name)

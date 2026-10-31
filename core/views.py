@@ -1,5 +1,5 @@
 from django.contrib.auth import authenticate, login, logout
-from django.db.models import Exists, OuterRef
+from django.db.models import Count, Exists, OuterRef, Q
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
@@ -14,6 +14,7 @@ from rest_framework.views import APIView
 from .importers import MAX_BYTES, ImportFileError, import_students
 from .models import AttendanceRecord, Enrollment, FeePlan, LedgerEntry, User
 from .selectors import (
+    attendance_records_for,
     batches_for,
     enrollments_for,
     fee_plans_for,
@@ -21,6 +22,7 @@ from .selectors import (
     students_for,
 )
 from .serializers import (
+    AttendanceRecordSerializer,
     AttendanceSheetInputSerializer,
     BatchSerializer,
     DuesRowSerializer,
@@ -52,6 +54,13 @@ def _digits(value):
     if value and len(value) <= 18 and value.isascii() and value.isdigit():
         return int(value)
     return None
+
+def _optional_date(request, name):
+    """A date from the query string, or None if it is missing. Bad text gives a 400."""
+    value = request.query_params.get(name)
+    if not value:
+        return None
+    return serializers.DateField().run_validation(value)
 
 # ---- Permissions ----------------------------------------------------------
 
@@ -420,3 +429,77 @@ class EnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
         if search:
             queryset = queryset.filter(student__full_name__icontains=search[:100])
         return queryset
+
+# ---- Attendance (reading) -------------------------------------------------
+
+
+class AttendanceViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Read attendance. Owners see everything, teachers their own batches,
+    parents their own children.
+    Filters: ?student=ID  ?batch=ID  ?from=YYYY-MM-DD  ?to=YYYY-MM-DD"""
+
+    serializer_class = AttendanceRecordSerializer
+
+    def _scoped(self):
+        params = self.request.query_params
+        queryset = attendance_records_for(self.request.user)
+        student = _digits(params.get("student"))
+        if student is not None:
+            queryset = queryset.filter(student_id=student)
+        batch = _digits(params.get("batch"))
+        if batch is not None:
+            queryset = queryset.filter(session__batch_id=batch)
+        start = _optional_date(self.request, "from")
+        if start is not None:
+            queryset = queryset.filter(session__date__gte=start)
+        end = _optional_date(self.request, "to")
+        if end is not None:
+            queryset = queryset.filter(session__date__lte=end)
+        return queryset
+
+    def get_queryset(self):
+        return (
+            self._scoped()
+            .select_related("student", "session__batch")
+            .order_by("-session__date", "student__full_name", "session__batch__name", "id")
+        )
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """Totals per student and batch, computed by the database in one query."""
+        grouped = (
+            self._scoped()
+            .values(
+                "student_id",
+                "student__full_name",
+                "session__batch_id",
+                "session__batch__name",
+            )
+            .annotate(
+                total=Count("id"),
+                present=Count("id", filter=Q(status=AttendanceRecord.Status.PRESENT)),
+                absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
+                late=Count("id", filter=Q(status=AttendanceRecord.Status.LATE)),
+                leave=Count("id", filter=Q(status=AttendanceRecord.Status.LEAVE)),
+            )
+            .order_by("student__full_name", "session__batch__name", "student_id")
+        )
+        data = []
+        for row in grouped[:500]:  # a sensible upper limit
+            counted = row["total"] - row["leave"]  # leave days do not count against
+            attended = row["present"] + row["late"]
+            data.append(
+                {
+                    "student": row["student_id"],
+                    "student_name": row["student__full_name"],
+                    "batch": row["session__batch_id"],
+                    "batch_name": row["session__batch__name"],
+                    "total": row["total"],
+                    "present": row["present"],
+                    "absent": row["absent"],
+                    "late": row["late"],
+                    "leave": row["leave"],
+                    "percent": round(attended * 100 / counted, 1) if counted else None,
+                }
+            )
+        return Response(data)

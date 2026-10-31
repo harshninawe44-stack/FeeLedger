@@ -1,4 +1,12 @@
-from .models import Batch, Enrollment, FeePlan, LedgerEntry, Student, User
+from .models import (
+    AttendanceRecord,
+    Batch,
+    Enrollment,
+    FeePlan,
+    LedgerEntry,
+    Student,
+    User,
+)
 
 
 def _role(user):
@@ -58,3 +66,13 @@ def ledger_entries_for(user):
     if role == User.Role.STUDENT:
         return LedgerEntry.objects.filter(fee_plan__enrollment__student__user=user)
     return LedgerEntry.objects.none()
+
+def attendance_records_for(user):
+    role = _role(user)
+    if role == User.Role.OWNER:
+        return AttendanceRecord.objects.all()
+    if role == User.Role.TEACHER:
+        return AttendanceRecord.objects.filter(session__batch__teacher=user)
+    if role == User.Role.STUDENT:
+        return AttendanceRecord.objects.filter(student__user=user)
+    return AttendanceRecord.objects.none()  # anyone else sees nothing

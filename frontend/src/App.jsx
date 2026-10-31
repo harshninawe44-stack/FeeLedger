@@ -4,6 +4,7 @@ import Login from './Login'
 import Dues from './Dues'
 import PlanDetail from './PlanDetail'
 import Attendance from './Attendance'
+import MyAttendance from './MyAttendance'
 import NewFeePlan from './NewFeePlan'
 import ImportStudents from './ImportStudents'
 
@@ -18,6 +19,7 @@ const ROLE_LABELS = {
 const PAGES = [
   { id: 'dues', label: 'Fees', roles: ['owner', 'student'] },
   { id: 'attendance', label: 'Attendance', roles: ['owner', 'teacher'] },
+  { id: 'myattendance', label: 'Attendance', roles: ['student'] },
   { id: 'newplan', label: 'New fee plan', roles: ['owner'] },
   { id: 'import', label: 'Import students', roles: ['owner'] },
 ]
@@ -106,6 +108,7 @@ export default function App() {
             <PlanDetail planId={planId} role={user.role} onBack={() => setPlanId(null)} />
           ))}
         {active?.id === 'attendance' && <Attendance role={user.role} />}
+        {active?.id === 'myattendance' && <MyAttendance />}
         {active?.id === 'newplan' && <NewFeePlan onCreated={openPlan} />}
         {active?.id === 'import' && <ImportStudents />}
       </main>
