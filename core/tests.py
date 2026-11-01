@@ -634,10 +634,13 @@ class ApiTests(TestCase):
         after = self.count_queries(self.owner, reverse("batch-list"))
         self.assertEqual(before, after)
 
-    def test_api_is_read_only(self):
+    def test_students_are_read_only_and_batches_cannot_be_deleted(self):
         self.api.force_authenticate(user=self.owner)
-        response = self.api.post(reverse("batch-list"), {"name": "Hacked"})
+        response = self.api.post(reverse("student-list"), {"full_name": "X"})
         self.assertEqual(response.status_code, 405)
+        url = reverse("batch-detail", args=[self.batch_a.pk])
+        self.assertEqual(self.api.delete(url).status_code, 405)
+        self.assertEqual(self.api.put(url, {"name": "X"}, format="json").status_code, 405)
 
 class ApiWriteTests(TestCase):
     def setUp(self):
@@ -1862,3 +1865,305 @@ class AttendanceReadApiTests(TestCase):
         for name in ("attendance-list", "attendance-summary"):
             response = self.api.post(reverse(name), {"status": "present"}, format="json")
             self.assertEqual(response.status_code, 405, name)
+
+class UserAdminApiTests(TestCase):
+    STRONG = "Sturdy-Pass-7391"
+
+    def setUp(self):
+        cache.clear()  # the login rate limit counts requests in the cache
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher = mk("tea", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        self.api = APIClient()
+        self.url = reverse("user-list")
+
+    def post(self, user, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(self.url, body, format="json")
+
+    def get(self, user, params=None):
+        self.api.force_authenticate(user=user)
+        return self.api.get(self.url, params or {})
+
+    def body(self, **changes):
+        data = {
+            "username": "new.teacher",
+            "first_name": "Nita",
+            "role": "teacher",
+            "password": self.STRONG,
+        }
+        data.update(changes)
+        return data
+
+    def test_only_the_owner_can_list_or_create_users(self):
+        self.assertEqual(self.get(None).status_code, 403)
+        for user in (self.teacher, self.parent):
+            self.assertEqual(self.get(user).status_code, 403)
+            self.assertEqual(self.post(user, self.body()).status_code, 403)
+        self.assertFalse(User.objects.filter(username="new.teacher").exists())
+
+    def test_owner_creates_a_teacher_who_can_log_in(self):
+        response = self.post(self.owner, self.body())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["username"], "new.teacher")
+        self.assertEqual(response.data["role"], "teacher")
+        self.assertNotIn("password", response.data)
+
+        user = User.objects.get(username="new.teacher")
+        self.assertTrue(user.is_active)
+        self.assertFalse(user.is_staff)
+        self.assertNotEqual(user.password, self.STRONG)  # stored as a hash
+        self.assertTrue(user.check_password(self.STRONG))
+
+        login = APIClient().post(
+            reverse("auth-login"),
+            {"username": "new.teacher", "password": self.STRONG},
+            format="json",
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.data["role"], "teacher")
+
+    def test_owner_creates_a_parent_account(self):
+        response = self.post(
+            self.owner, self.body(username="parent.one", role="student")
+        )
+        self.assertEqual(response.status_code, 201)
+        created = User.objects.get(username="parent.one")
+        self.assertEqual(created.role, User.Role.STUDENT)
+
+    def test_owner_accounts_cannot_be_created_here(self):
+        for role in ("owner", "admin", ""):
+            response = self.post(self.owner, self.body(role=role))
+            self.assertEqual(response.status_code, 400, role)
+        self.assertFalse(User.objects.filter(username="new.teacher").exists())
+
+    def test_duplicate_usernames_are_rejected_ignoring_case(self):
+        for name in ("tea", "TEA", "Tea"):
+            response = self.post(self.owner, self.body(username=name))
+            self.assertEqual(response.status_code, 400, name)
+        self.assertEqual(User.objects.count(), 3)
+
+    def test_bad_usernames_are_rejected(self):
+        for name in ("", "has space", "x" * 151, "bad/name!"):
+            response = self.post(self.owner, self.body(username=name))
+            self.assertEqual(response.status_code, 400, name)
+        self.assertEqual(User.objects.count(), 3)
+
+    def test_weak_passwords_are_rejected(self):
+        # These rely on AUTH_PASSWORD_VALIDATORS in settings.py (Django's default).
+        for password in ("short", "12345678", "password", "new.teacher1"):
+            response = self.post(self.owner, self.body(password=password))
+            self.assertEqual(response.status_code, 400, password)
+        self.assertFalse(User.objects.filter(username="new.teacher").exists())
+
+    def test_missing_fields_return_400(self):
+        for field in ("username", "role", "password"):
+            body = self.body()
+            del body[field]
+            self.assertEqual(self.post(self.owner, body).status_code, 400, field)
+        body = self.body()
+        del body["first_name"]  # the name is optional
+        self.assertEqual(self.post(self.owner, body).status_code, 201)
+
+    def test_list_filters_and_passwords_are_never_shown(self):
+        User.objects.create_user(
+            "gone", password="pw", role=User.Role.TEACHER, is_active=False
+        )
+        User.objects.create_user("zed", password="pw", role=User.Role.STUDENT)
+
+        everyone = self.get(self.owner).data["results"]
+        self.assertEqual(
+            [u["username"] for u in everyone], ["gone", "own", "par", "tea", "zed"]
+        )
+        for row in everyone:
+            self.assertEqual(
+                set(row), {"id", "username", "first_name", "role", "is_active"}
+            )
+
+        teachers = self.get(self.owner, {"role": "teacher"}).data["results"]
+        self.assertEqual([u["username"] for u in teachers], ["gone", "tea"])
+        active = self.get(self.owner, {"role": "teacher", "active": "1"}).data["results"]
+        self.assertEqual([u["username"] for u in active], ["tea"])
+        found = self.get(self.owner, {"search": "ZE"}).data["results"]
+        self.assertEqual([u["username"] for u in found], ["zed"])
+
+        odd = self.get(self.owner, {"role": "nonsense", "search": "x" * 500})
+        self.assertEqual(odd.status_code, 200)
+
+    def test_user_list_query_count_does_not_grow(self):
+        self.api.force_authenticate(user=self.owner)
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(self.url)
+        for i in range(5):
+            User.objects.create_user(
+                f"extra{i}", password="pw", role=User.Role.STUDENT
+            )
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(self.url)
+        self.assertEqual(len(before), len(after))
+
+
+class BatchAdminApiTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.retired = mk(
+            "old", password="pw", role=User.Role.TEACHER, is_active=False
+        )
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        self.api = APIClient()
+
+    def post(self, user, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(reverse("batch-list"), body, format="json")
+
+    def patch(self, user, batch, body):
+        self.api.force_authenticate(user=user)
+        url = reverse("batch-detail", args=[batch.pk])
+        return self.api.patch(url, body, format="json")
+
+    def get(self, user, name, *args):
+        self.api.force_authenticate(user=user)
+        return self.api.get(reverse(name, args=list(args)))
+
+    def body(self, **changes):
+        data = {
+            "name": "JEE Morning",
+            "teacher": self.teacher_a.pk,
+            "start_date": "2026-11-02",
+        }
+        data.update(changes)
+        return data
+
+    def make_batch(self, name="Existing", teacher=None):
+        return Batch.objects.create(
+            name=name, teacher=teacher or self.teacher_a, start_date=date(2026, 6, 1)
+        )
+
+    def test_owner_creates_a_batch(self):
+        response = self.post(self.owner, self.body())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["name"], "JEE Morning")
+        self.assertEqual(response.data["teacher"], self.teacher_a.pk)
+        self.assertEqual(response.data["teacher_name"], "ta")
+        self.assertTrue(response.data["is_active"])
+        batch = Batch.objects.get()
+        self.assertEqual(batch.teacher, self.teacher_a)
+        self.assertEqual(batch.start_date, date(2026, 11, 2))
+
+    def test_only_the_owner_can_create_or_change_batches(self):
+        batch = self.make_batch()
+        for user in (self.teacher_a, self.parent):
+            self.assertEqual(self.post(user, self.body(name="Other")).status_code, 403)
+            response = self.patch(user, batch, {"name": "Renamed"})
+            self.assertEqual(response.status_code, 403)
+        batch.refresh_from_db()
+        self.assertEqual(batch.name, "Existing")
+        self.assertEqual(Batch.objects.count(), 1)
+
+    def test_batch_teacher_must_be_an_active_teacher(self):
+        for teacher in (self.owner.pk, self.parent.pk, self.retired.pk, 99999):
+            response = self.post(self.owner, self.body(teacher=teacher))
+            self.assertEqual(response.status_code, 400, teacher)
+        self.assertEqual(Batch.objects.count(), 0)
+
+    def test_batch_names_are_trimmed_and_unique_ignoring_case(self):
+        self.make_batch("Twin Name")
+        for name in ("Twin Name", "TWIN NAME", "  twin name  "):
+            response = self.post(self.owner, self.body(name=name))
+            self.assertEqual(response.status_code, 400, name)
+        self.assertEqual(Batch.objects.count(), 1)
+        response = self.post(self.owner, self.body(name="  NEET Evening  "))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["name"], "NEET Evening")
+
+    def test_required_fields_and_bad_values_return_400(self):
+        for field in ("name", "teacher", "start_date"):
+            body = self.body()
+            del body[field]
+            self.assertEqual(self.post(self.owner, body).status_code, 400, field)
+        bad = [
+            {"name": "   "},
+            {"name": ""},
+            {"name": "x" * 101},
+            {"start_date": "02/11/2026"},
+            {"start_date": "2026-02-31"},
+        ]
+        for changes in bad:
+            response = self.post(self.owner, self.body(**changes))
+            self.assertEqual(response.status_code, 400, changes)
+        self.assertEqual(Batch.objects.count(), 0)
+
+    def test_owner_edits_a_batch(self):
+        batch = self.make_batch("Old Name")
+        other = self.make_batch("Other", teacher=self.teacher_b)
+
+        response = self.patch(self.owner, batch, {"name": "New Name"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["name"], "New Name")
+        # changing only the capital letters of its own name is allowed
+        self.assertEqual(
+            self.patch(self.owner, batch, {"name": "NEW NAME"}).status_code, 200
+        )
+        # another batch's name is not
+        self.assertEqual(
+            self.patch(self.owner, batch, {"name": "other"}).status_code, 400
+        )
+        response = self.patch(
+            self.owner, batch, {"is_active": False, "start_date": "2026-12-01"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+        batch.refresh_from_db()
+        self.assertEqual(batch.name, "NEW NAME")
+        self.assertFalse(batch.is_active)
+        self.assertEqual(batch.start_date, date(2026, 12, 1))
+        other.refresh_from_db()
+        self.assertEqual(other.name, "Other")
+        self.assertEqual(other.teacher, self.teacher_b)
+
+        self.api.force_authenticate(user=self.owner)
+        missing = self.api.patch(
+            reverse("batch-detail", args=[99999]), {}, format="json"
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    def test_reassigning_a_batch_moves_access_between_teachers(self):
+        batch = self.make_batch("Moving", teacher=self.teacher_a)
+        self.assertEqual(self.get(self.teacher_a, "batch-detail", batch.pk).status_code, 200)
+        self.assertEqual(self.get(self.teacher_b, "batch-detail", batch.pk).status_code, 404)
+
+        # a retired teacher cannot be assigned
+        response = self.patch(self.owner, batch, {"teacher": self.retired.pk})
+        self.assertEqual(response.status_code, 400)
+
+        response = self.patch(self.owner, batch, {"teacher": self.teacher_b.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["teacher_name"], "tb")
+
+        self.assertEqual(self.get(self.teacher_a, "batch-detail", batch.pk).status_code, 404)
+        self.assertEqual(self.get(self.teacher_b, "batch-detail", batch.pk).status_code, 200)
+
+    def test_a_batch_whose_teacher_retired_can_still_be_renamed(self):
+        batch = self.make_batch("Legacy", teacher=self.retired)
+        response = self.patch(self.owner, batch, {"name": "Legacy 2"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["teacher_name"], "old")
+
+    def test_new_batch_is_usable_for_attendance_by_its_teacher(self):
+        created = self.post(
+            self.owner, self.body(name="Fresh", teacher=self.teacher_b.pk)
+        )
+        batch_id = created.data["id"]
+
+        listing = self.get(self.teacher_b, "batch-list")
+        self.assertEqual([b["name"] for b in listing.data["results"]], ["Fresh"])
+        roster = self.get(self.teacher_b, "batch-attendance", batch_id)
+        self.assertEqual(roster.status_code, 200)
+        self.assertEqual(roster.data["records"], [])
+        self.assertEqual(
+            self.get(self.teacher_a, "batch-attendance", batch_id).status_code, 404
+        )

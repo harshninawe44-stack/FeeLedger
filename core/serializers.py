@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+from django.contrib.auth import password_validation
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from .models import (
@@ -10,14 +12,30 @@ from .models import (
     Installment,
     LedgerEntry,
     Student,
+    User,
 )
 
 class BatchSerializer(serializers.ModelSerializer):
+    # Only an active teacher can be assigned to a batch.
+    teacher = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(role=User.Role.TEACHER, is_active=True)
+    )
     teacher_name = serializers.CharField(source="teacher.username", read_only=True)
 
     class Meta:
         model = Batch
         fields = ["id", "name", "teacher", "teacher_name", "start_date", "is_active"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        # The CSV importer finds batches by name, so names must not clash,
+        # even when they differ only in capital letters.
+        clash = Batch.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError("A batch with this name already exists.")
+        return value
 
 
 class StudentSerializer(serializers.ModelSerializer):
@@ -208,3 +226,58 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             "id", "student", "student_name", "batch", "batch_name", "date", "status",
         ]
         read_only_fields = fields
+
+# ---- Accounts (owner screens) ---------------------------------------------
+
+
+class UserSerializer(serializers.ModelSerializer):
+    """What the API SHOWS for an account. Never includes the password."""
+
+    class Meta:
+        model = User
+        fields = ["id", "username", "first_name", "role", "is_active"]
+        read_only_fields = fields
+
+
+class UserCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["username", "first_name", "role", "password"]
+        extra_kwargs = {
+            # write_only: accepted when creating, never sent back.
+            # trim_whitespace=False: spaces at the ends are part of a password.
+            "password": {
+                "write_only": True,
+                "trim_whitespace": False,
+                "style": {"input_type": "password"},
+            },
+            "role": {"required": True},
+        }
+
+    def validate_username(self, value):
+        if User.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def validate_role(self, value):
+        if value not in (User.Role.TEACHER, User.Role.STUDENT):
+            raise serializers.ValidationError(
+                "Only teacher and parent accounts can be created here."
+            )
+        return value
+
+    def validate(self, attrs):
+        # Django's own password rules (length, common passwords, similarity
+        # to the username). They are listed in AUTH_PASSWORD_VALIDATORS.
+        candidate = User(
+            username=attrs["username"], first_name=attrs.get("first_name", "")
+        )
+        try:
+            password_validation.validate_password(attrs["password"], candidate)
+        except DjangoValidationError as error:
+            raise serializers.ValidationError({"password": list(error.messages)})
+        return attrs
+
+    def create(self, validated_data):
+        # create_user hashes the password. Plain create() would store it as text.
+        return User.objects.create_user(**validated_data)

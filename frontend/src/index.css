@@ -344,3 +344,15 @@ button.primary:disabled {
   background: #dbeafe;
   color: #1d4ed8;
 }
+.topbar {
+  flex-wrap: wrap;
+}
+.badge.muted {
+  background: #e4e7eb;
+  color: #52606d;
+}
+.payment-form input[type='checkbox'] {
+  display: inline-block;
+  width: auto;
+  margin-right: 0.4rem;
+}

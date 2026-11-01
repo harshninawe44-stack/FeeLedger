@@ -14,6 +14,7 @@ from .views import (
     MeView,
     PaymentViewSet,
     StudentViewSet,
+    UserViewSet,
 )
 
 router = DefaultRouter()
@@ -23,6 +24,7 @@ router.register("payments", PaymentViewSet, basename="payment")
 router.register("fee-plans", FeePlanViewSet, basename="feeplan")
 router.register("enrollments", EnrollmentViewSet, basename="enrollment")
 router.register("attendance", AttendanceViewSet, basename="attendance")
+router.register("users", UserViewSet, basename="user")
 
 urlpatterns = [
     path("auth/csrf/", CsrfView.as_view(), name="auth-csrf"),

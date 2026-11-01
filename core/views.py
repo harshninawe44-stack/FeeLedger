@@ -37,6 +37,8 @@ from .serializers import (
     PaymentInputSerializer,
     ReverseInputSerializer,
     StudentSerializer,
+    UserCreateSerializer,
+    UserSerializer,
 )
 from .services import (
     AttendanceError,
@@ -158,8 +160,24 @@ def _attendance_sheet(batch, day):
     }
 
 
-class BatchViewSet(viewsets.ReadOnlyModelViewSet):
+class BatchViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Everyone reads their own batches. Only the owner creates or edits."""
+
     serializer_class = BatchSerializer
+    # No PUT and no DELETE: batches are edited with PATCH or deactivated.
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update"):
+            return [permissions.IsAuthenticated(), IsOwner()]
+        # The attendance action carries its own permission_classes.
+        return super().get_permissions()
 
     def get_queryset(self):
         return batches_for(self.request.user).select_related("teacher").order_by("name")
@@ -193,7 +211,6 @@ class BatchViewSet(viewsets.ReadOnlyModelViewSet):
         except AttendanceError as error:
             raise ValidationError({"detail": str(error)})
         return Response(_attendance_sheet(batch, day))
-
 
 # ---- Payments -------------------------------------------------------------
 
@@ -503,3 +520,36 @@ class AttendanceViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
                 }
             )
         return Response(data)
+
+# ---- Accounts (owner screens) ---------------------------------------------
+
+
+class UserViewSet(
+    mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.GenericViewSet
+):
+    """List accounts and create teacher or parent accounts. Owner only.
+    Filters: ?role=teacher|student|owner  ?active=1  ?search=username"""
+
+    permission_classes = [permissions.IsAuthenticated, IsOwner]
+
+    def get_serializer_class(self):
+        return UserCreateSerializer if self.action == "create" else UserSerializer
+
+    def get_queryset(self):
+        queryset = User.objects.order_by("username")
+        params = self.request.query_params
+        role = params.get("role")
+        if role in User.Role.values:
+            queryset = queryset.filter(role=role)
+        if params.get("active") == "1":
+            queryset = queryset.filter(is_active=True)
+        search = params.get("search", "").strip()
+        if search:
+            queryset = queryset.filter(username__icontains=search[:100])
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        user = body.save()
+        return Response(UserSerializer(user).data, status=201)
