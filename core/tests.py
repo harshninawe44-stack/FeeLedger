@@ -53,6 +53,19 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework.test import APIClient
 
+from io import StringIO
+
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import override_settings
+
+from .management.commands.seed_demo import (
+    DEMO_PASSWORD,
+    OWNER_USERNAME,
+    PARENT_USERNAMES,
+    TEACHER_USERNAMES,
+)
+
 
 class LedgerTests(TestCase):
     def setUp(self):
@@ -2703,3 +2716,210 @@ class ImportInactiveStudentTests(TestCase):
         self.assertEqual(len(result["errors"]), 1)
         self.assertEqual(result["errors"][0]["field"], "full_name")
         self.assertEqual(Enrollment.objects.count(), 0)
+
+class AdminLockdownTests(TestCase):
+    def setUp(self):
+        self.root = User.objects.create_superuser("root", password="pw")
+        teacher = User.objects.create_user(
+            "t_admin", password="pw", role=User.Role.TEACHER
+        )
+        self.batch = Batch.objects.create(
+            name="A", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+        self.student = Student.objects.create(full_name="Asha", phone="9000000001")
+        enrollment = Enrollment.objects.create(
+            student=self.student, batch=self.batch, joined_on=date(2026, 6, 1)
+        )
+        self.plan = create_fee_plan(
+            enrollment=enrollment,
+            total_amount="3000.00",
+            due_dates=[date(2026, 7, 1), date(2026, 8, 1), date(2026, 9, 1)],
+        )
+        self.payment = record_payment(
+            fee_plan=self.plan, amount=Decimal("500.00"), method="cash",
+            paid_on=date(2026, 7, 1), received_by=self.root,
+        )
+        mark_attendance(
+            batch=self.batch, date=date(2026, 10, 30),
+            statuses={self.student.pk: "present"}, marked_by=self.root,
+            today=date(2026, 10, 31),
+        )
+        self.client.force_login(self.root)
+
+    def test_fee_plans_cannot_be_added_changed_or_deleted(self):
+        add = reverse("admin:core_feeplan_add")
+        change = reverse("admin:core_feeplan_change", args=[self.plan.pk])
+        delete = reverse("admin:core_feeplan_delete", args=[self.plan.pk])
+        self.assertEqual(self.client.get(add).status_code, 403)
+        self.assertEqual(self.client.get(change).status_code, 200)  # looking is fine
+        self.assertEqual(
+            self.client.post(change, {"total_amount": "1.00"}).status_code, 403
+        )
+        self.assertEqual(self.client.get(delete).status_code, 403)
+        self.assertEqual(self.client.post(delete, {"post": "yes"}).status_code, 403)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.total_amount, Decimal("3000.00"))
+        self.assertEqual(FeePlan.objects.count(), 1)
+
+    def test_installments_cannot_be_edited_through_the_plan_page(self):
+        first = self.plan.installments.get(number=1)
+        data = {
+            "total_amount": "3000.00",
+            "installments-TOTAL_FORMS": "1",
+            "installments-INITIAL_FORMS": "1",
+            "installments-0-id": first.pk,
+            "installments-0-fee_plan": self.plan.pk,
+            "installments-0-amount": "1.00",
+            "installments-0-due_date": "2026-07-01",
+        }
+        change = reverse("admin:core_feeplan_change", args=[self.plan.pk])
+        self.assertEqual(self.client.post(change, data).status_code, 403)
+        first.refresh_from_db()
+        self.assertEqual(first.amount, Decimal("1000.00"))
+        self.assertEqual(Installment.objects.count(), 3)
+
+    def test_ledger_and_attendance_cannot_be_added_in_the_admin(self):
+        for name in (
+            "admin:core_ledgerentry_add",
+            "admin:core_attendancesession_add",
+            "admin:core_attendancechange_add",
+        ):
+            self.assertEqual(self.client.get(reverse(name)).status_code, 403, name)
+        self.assertEqual(LedgerEntry.objects.count(), 1)
+        self.assertEqual(AttendanceSession.objects.count(), 1)
+
+    def test_ledger_entries_cannot_be_changed_or_deleted_and_lists_load(self):
+        change = reverse("admin:core_ledgerentry_change", args=[self.payment.pk])
+        delete = reverse("admin:core_ledgerentry_delete", args=[self.payment.pk])
+        self.assertEqual(self.client.post(change, {"amount": "1.00"}).status_code, 403)
+        self.assertEqual(self.client.post(delete, {"post": "yes"}).status_code, 403)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.amount, Decimal("500.00"))
+        for name in (
+            "admin:core_feeplan_changelist",
+            "admin:core_ledgerentry_changelist",
+            "admin:core_attendancesession_changelist",
+            "admin:core_attendancechange_changelist",
+        ):
+            self.assertEqual(self.client.get(reverse(name)).status_code, 200, name)
+
+
+class SeedDemoTests(TestCase):
+    def seed(self):
+        call_command("seed_demo", stdout=StringIO())
+
+    @override_settings(DEBUG=False)
+    def test_refuses_to_run_when_debug_is_off(self):
+        with self.assertRaises(CommandError):
+            self.seed()
+        self.assertEqual(Batch.objects.count(), 0)
+        self.assertEqual(User.objects.count(), 0)
+
+    @override_settings(DEBUG=True)
+    def test_refuses_when_data_already_exists(self):
+        Student.objects.create(full_name="Real Student", phone="9000000000")
+        with self.assertRaises(CommandError):
+            self.seed()
+        self.assertEqual(Batch.objects.count(), 0)
+        self.assertEqual(Student.objects.count(), 1)
+        self.assertFalse(User.objects.filter(username=OWNER_USERNAME).exists())
+
+    @override_settings(DEBUG=True)
+    def test_refuses_to_run_twice(self):
+        self.seed()
+        with self.assertRaises(CommandError):
+            self.seed()
+        self.assertEqual(Batch.objects.count(), 3)
+
+    @override_settings(DEBUG=True)
+    def test_creates_realistic_demo_data(self):
+        self.seed()
+        self.assertEqual(Batch.objects.count(), 3)
+        self.assertEqual(Student.objects.count(), 15)
+        self.assertEqual(Enrollment.objects.count(), 16)
+        self.assertEqual(FeePlan.objects.count(), 16)
+        self.assertEqual(LedgerEntry.objects.filter(kind="reversal").count(), 1)
+        self.assertGreater(LedgerEntry.objects.filter(kind="payment").count(), 20)
+        self.assertGreater(AttendanceSession.objects.count(), 10)
+        self.assertEqual(User.objects.filter(role=User.Role.TEACHER).count(), 3)
+        self.assertEqual(User.objects.filter(role=User.Role.STUDENT).count(), 5)
+
+    @override_settings(DEBUG=True)
+    def test_every_fee_plan_is_consistent_and_never_overpaid(self):
+        self.seed()
+        for plan in FeePlan.objects.prefetch_related("installments"):
+            amounts = [item.amount for item in plan.installments.all()]
+            self.assertEqual(sum(amounts), plan.total_amount)
+            self.assertTrue(all(amount > 0 for amount in amounts))
+            paid = net_paid(plan)
+            self.assertGreaterEqual(paid, 0)
+            self.assertLessEqual(paid, plan.total_amount)
+
+    @override_settings(DEBUG=True)
+    def test_demo_has_paid_up_overdue_and_unpaid_students(self):
+        self.seed()
+        rows = list(dues_report())
+        self.assertTrue([r for r in rows if r.overdue > 0])
+        self.assertTrue([r for r in rows if r.overdue == 0 and r.paid > 0])
+        self.assertTrue([r for r in rows if r.paid == 0])
+        # the payment entered for the wrong student was reversed
+        vihaan = [r for r in rows if r.enrollment.student.full_name == "Vihaan Patil"]
+        self.assertEqual(vihaan[0].paid, Decimal("0.00"))
+
+    @override_settings(DEBUG=True)
+    def test_demo_accounts_work_and_are_scoped(self):
+        self.seed()
+        owner = User.objects.get(username=OWNER_USERNAME)
+        self.assertEqual(owner.role, User.Role.OWNER)
+        self.assertTrue(owner.check_password(DEMO_PASSWORD))
+        for username in TEACHER_USERNAMES:
+            teacher = User.objects.get(username=username)
+            self.assertTrue(teacher.check_password(DEMO_PASSWORD))
+            self.assertEqual(batches_for(teacher).count(), 1)
+            self.assertEqual(fee_plans_for(teacher).count(), 0)
+        for username in PARENT_USERNAMES:
+            parent = User.objects.get(username=username)
+            self.assertTrue(parent.check_password(DEMO_PASSWORD))
+            self.assertTrue(Student.objects.filter(user=parent).exists())
+            plans = fee_plans_for(parent)
+            self.assertTrue(plans.exists())
+            self.assertFalse(plans.exclude(enrollment__student__user=parent).exists())
+        kabir = Student.objects.get(full_name="Kabir Menon")
+        self.assertEqual(kabir.enrollments.count(), 2)
+
+    @override_settings(DEBUG=True)
+    def test_dues_report_is_one_query_on_the_demo_data(self):
+        self.seed()
+        owner = User.objects.get(username=OWNER_USERNAME)
+        with self.assertNumQueries(1):
+            rows = list(dues_report(fee_plans=fee_plans_for(owner)))
+            for row in rows:
+                row.enrollment.student.full_name
+                row.enrollment.batch.name
+                row.paid, row.overdue, row.balance
+        self.assertEqual(len(rows), 16)
+
+    @override_settings(DEBUG=True)
+    def test_existing_owner_is_used_and_no_demo_owner_is_created(self):
+        existing = User.objects.create_superuser("real_owner", password="pw")
+        self.seed()
+        self.assertFalse(User.objects.filter(username=OWNER_USERNAME).exists())
+        self.assertFalse(LedgerEntry.objects.exclude(received_by=existing).exists())
+
+    @override_settings(DEBUG=True)
+    def test_attendance_covers_enrolled_students_on_recent_non_sundays(self):
+        self.seed()
+        today = timezone.localdate()
+        sessions = list(AttendanceSession.objects.select_related("batch"))
+        self.assertTrue(sessions)
+        for session in sessions:
+            self.assertLessEqual(session.date, today)
+            self.assertLessEqual((today - session.date).days, 7)
+            self.assertNotEqual(session.date.weekday(), 6)
+            enrolled = set(
+                Enrollment.objects.filter(batch=session.batch, is_active=True)
+                .values_list("student_id", flat=True)
+            )
+            marked = set(session.records.values_list("student_id", flat=True))
+            self.assertEqual(marked, enrolled)
+        self.assertTrue(AttendanceChange.objects.exists())
