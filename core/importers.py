@@ -153,6 +153,14 @@ def _validate(rows):
             continue
         student = found[0] if found else None
 
+        if student is not None and not student.is_active:
+            fail(
+                item["line"],
+                "full_name",
+                f"{student.full_name} is not an active student. Reactivate them first.",
+            )
+            continue
+
         pair = (key, item["batch"].pk)
         if pair in first_seen:
             fail(

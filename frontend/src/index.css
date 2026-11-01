@@ -356,3 +356,26 @@ button.primary:disabled {
   width: auto;
   margin-right: 0.4rem;
 }
+.parent-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.75rem;
+  align-items: end;
+}
+.parent-picker select {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.45rem;
+  margin-top: 0.25rem;
+}
+.badge-list {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.toolbar input[type='checkbox'] {
+  display: inline-block;
+  width: auto;
+  margin: 0 0.4rem 0 0;
+}

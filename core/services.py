@@ -9,12 +9,15 @@ from .models import (
     AttendanceChange,
     AttendanceRecord,
     AttendanceSession,
+    Batch,
     Enrollment,
     FeePlan,
     Installment,
     LedgerEntry,
+    Student,
     User,
 )
+
 from .selectors import batches_for
 
 
@@ -287,3 +290,63 @@ def create_fee_plan(*, enrollment, total_amount, due_dates):
         ]
     )
     return plan
+
+class EnrollmentError(Exception):
+    """Raised when enrolling a student would break a rule."""
+
+
+@transaction.atomic
+def enroll_student(*, student, batch, joined_on=None):
+    # Lock the student's row, so two simultaneous requests cannot both pass
+    # the "already enrolled" check below.
+    student = Student.objects.select_for_update().get(pk=student.pk)
+    batch = Batch.objects.get(pk=batch.pk)
+    if not student.is_active:
+        raise EnrollmentError("This student is not active.")
+    if not batch.is_active:
+        raise EnrollmentError("This batch is not active.")
+
+    existing = Enrollment.objects.filter(student=student, batch=batch).first()
+    if existing is not None and existing.is_active:
+        raise EnrollmentError(
+            f"{student.full_name} is already enrolled in {batch.name}."
+        )
+    if existing is not None:
+        raise EnrollmentError(
+            f"{student.full_name} was enrolled in {batch.name} before. "
+            "Reactivate that enrolment instead of adding a new one."
+        )
+    return Enrollment.objects.create(
+        student=student, batch=batch, joined_on=joined_on or timezone.localdate()
+    )
+
+
+@transaction.atomic
+def create_student(
+    *, full_name, phone, guardian_name="", user=None, batch=None, joined_on=None
+):
+    """Add a student, and enrol them at the same time if a batch is given.
+    Both happen together or not at all."""
+    student = Student.objects.create(
+        full_name=full_name, phone=phone, guardian_name=guardian_name, user=user
+    )
+    if batch is not None:
+        enroll_student(student=student, batch=batch, joined_on=joined_on)
+    return student
+
+
+@transaction.atomic
+def set_enrollment_active(*, enrollment, is_active):
+    enrollment = (
+        Enrollment.objects.select_for_update(of=("self",))
+        .select_related("student", "batch")
+        .get(pk=enrollment.pk)
+    )
+    if is_active and not enrollment.student.is_active:
+        raise EnrollmentError("This student is not active. Reactivate the student first.")
+    if is_active and not enrollment.batch.is_active:
+        raise EnrollmentError("This batch is not active.")
+    if enrollment.is_active != is_active:
+        enrollment.is_active = is_active
+        enrollment.save(update_fields=["is_active"])
+    return enrollment

@@ -1,9 +1,12 @@
+import re
 from decimal import Decimal
 
 from django.contrib.auth import password_validation
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from rest_framework import serializers
 
+from .importers import PHONE_PATTERN
 from .models import (
     AttendanceRecord,
     Batch,
@@ -14,6 +17,7 @@ from .models import (
     Student,
     User,
 )
+from .services import create_student
 
 class BatchSerializer(serializers.ModelSerializer):
     # Only an active teacher can be assigned to a batch.
@@ -281,3 +285,120 @@ class UserCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # create_user hashes the password. Plain create() would store it as text.
         return User.objects.create_user(**validated_data)
+
+# ---- Students and enrolments (owner screens) -------------------------------
+
+
+class EnrollmentBriefSerializer(serializers.ModelSerializer):
+    """One enrolment, shown inside a student."""
+
+    batch_name = serializers.CharField(source="batch.name", read_only=True)
+
+    class Meta:
+        model = Enrollment
+        fields = ["id", "batch", "batch_name", "joined_on", "is_active"]
+        read_only_fields = fields
+
+
+def clean_phone(value):
+    """Drop spaces, dashes and brackets, the same way the CSV importer does."""
+    return re.sub(r"[\s\-()]", "", value)
+
+
+class StudentRulesMixin:
+    """Rules shared by adding and editing a student."""
+
+    def validate_phone(self, value):
+        value = clean_phone(value)
+        if not PHONE_PATTERN.match(value):
+            raise serializers.ValidationError(
+                "Phone must be 10 to 13 digits, optionally starting with +."
+            )
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = getattr(self, "instance", None)
+        # Only look for a clash when the name or phone is being set or changed,
+        # so old data can never block an edit of something else.
+        if instance is None or "full_name" in attrs or "phone" in attrs:
+            name = attrs.get("full_name", instance.full_name if instance else "")
+            phone = attrs.get("phone", instance.phone if instance else "")
+            clash = Student.objects.filter(full_name__iexact=name, phone=phone)
+            if instance is not None:
+                clash = clash.exclude(pk=instance.pk)
+            if phone and clash.exists():
+                raise serializers.ValidationError(
+                    "A student with this name and phone already exists."
+                )
+        return attrs
+
+
+class StudentAdminSerializer(StudentRulesMixin, serializers.ModelSerializer):
+    """What the owner sees when listing students, and what an edit accepts."""
+
+    phone = serializers.CharField(max_length=20, required=False)
+    user = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(role=User.Role.STUDENT, is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    parent_name = serializers.SerializerMethodField()
+    enrollments = EnrollmentBriefSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Student
+        fields = [
+            "id", "full_name", "phone", "guardian_name", "user",
+            "parent_name", "is_active", "enrollments",
+        ]
+
+    def get_parent_name(self, obj):
+        return obj.user.username if obj.user_id else None
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        was_active = instance.is_active
+        student = super().update(instance, validated_data)
+        if was_active and not student.is_active:
+            # A student who has left no longer appears on any attendance sheet.
+            student.enrollments.filter(is_active=True).update(is_active=False)
+        return student
+
+
+class StudentCreateSerializer(StudentRulesMixin, serializers.ModelSerializer):
+    """What the owner sends to add a student, optionally enrolling them at once."""
+
+    phone = serializers.CharField(max_length=20)
+    user = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(role=User.Role.STUDENT, is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    batch = serializers.PrimaryKeyRelatedField(
+        queryset=Batch.objects.all(), required=False, allow_null=True, write_only=True
+    )
+    joined_on = serializers.DateField(required=False, write_only=True)
+
+    class Meta:
+        model = Student
+        fields = ["full_name", "phone", "guardian_name", "user", "batch", "joined_on"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs.get("joined_on") and not attrs.get("batch"):
+            raise serializers.ValidationError("Choose a batch to set a joining date.")
+        return attrs
+
+    def create(self, validated_data):
+        return create_student(**validated_data)
+
+
+class EnrollmentCreateSerializer(serializers.Serializer):
+    student = serializers.PrimaryKeyRelatedField(queryset=Student.objects.all())
+    batch = serializers.PrimaryKeyRelatedField(queryset=Batch.objects.all())
+    joined_on = serializers.DateField(required=False)
+
+
+class EnrollmentUpdateSerializer(serializers.Serializer):
+    is_active = serializers.BooleanField()

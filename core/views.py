@@ -1,5 +1,5 @@
 from django.contrib.auth import authenticate, login, logout
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
@@ -26,7 +26,9 @@ from .serializers import (
     AttendanceSheetInputSerializer,
     BatchSerializer,
     DuesRowSerializer,
+    EnrollmentCreateSerializer,
     EnrollmentSerializer,
+    EnrollmentUpdateSerializer,
     FeePlanInputSerializer,
     FeePlanPreviewInputSerializer,
     FeePlanSerializer,
@@ -36,19 +38,24 @@ from .serializers import (
     LoginSerializer,
     PaymentInputSerializer,
     ReverseInputSerializer,
+    StudentAdminSerializer,
+    StudentCreateSerializer,
     StudentSerializer,
     UserCreateSerializer,
     UserSerializer,
 )
 from .services import (
     AttendanceError,
+    EnrollmentError,
     LedgerError,
     create_fee_plan,
     dues_report,
+    enroll_student,
     mark_attendance,
     preview_installments,
     record_payment,
     reverse_payment,
+    set_enrollment_active,
 )
 
 def _digits(value):
@@ -105,11 +112,72 @@ class MeView(APIView):
         return Response({"id": user.id, "username": user.username, "role": user.role})
 
 
-class StudentViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = StudentSerializer
+class StudentViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Everyone reads the students they may see. Only the owner adds or edits.
+    Filters: ?search=name-or-phone  ?active=1
+    Owner only: ?batch=ID  ?without_parent=1"""
+
+    # No PUT and no DELETE: students are edited with PATCH or deactivated.
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def _is_owner(self):
+        user = self.request.user
+        return user.is_authenticated and user.role == User.Role.OWNER
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update"):
+            return [permissions.IsAuthenticated(), IsOwner()]
+        return super().get_permissions()
+
+    def get_serializer_class(self):
+        if not self._is_owner():
+            return StudentSerializer
+        if self.action == "create":
+            return StudentCreateSerializer
+        return StudentAdminSerializer
 
     def get_queryset(self):
-        return students_for(self.request.user).order_by("full_name")
+        queryset = students_for(self.request.user)
+        params = self.request.query_params
+        search = params.get("search", "").strip()[:100]
+        if search:
+            queryset = queryset.filter(
+                Q(full_name__icontains=search) | Q(phone__icontains=search)
+            )
+        if params.get("active") == "1":
+            queryset = queryset.filter(is_active=True)
+        if self._is_owner():
+            # These two would let a teacher learn about batches that are not
+            # theirs, so only the owner may use them.
+            batch = _digits(params.get("batch"))
+            if batch is not None:
+                queryset = queryset.filter(enrollments__batch_id=batch).distinct()
+            if params.get("without_parent") == "1":
+                queryset = queryset.filter(user__isnull=True)
+            queryset = queryset.select_related("user").prefetch_related(
+                Prefetch(
+                    "enrollments",
+                    queryset=Enrollment.objects.select_related("batch").order_by(
+                        "batch__name"
+                    ),
+                )
+            )
+        return queryset.order_by("full_name", "id")
+
+    def create(self, request, *args, **kwargs):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        try:
+            student = body.save()
+        except EnrollmentError as error:
+            raise ValidationError({"detail": str(error)})
+        return Response(StudentAdminSerializer(student).data, status=201)
 
 
 class DuesView(generics.ListAPIView):
@@ -419,15 +487,29 @@ class LogoutView(APIView):
 # ---- Enrollments (owner screens) ------------------------------------------
 
 
-class EnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
-    """Lets the owner pick who needs a fee plan. Filters: ?without_plan=1,
-    ?active=1 and ?search=name."""
+class EnrollmentViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Owner only. List enrolments, enrol a student in a batch, or end or
+    restore an enrolment. Filters: ?without_plan=1  ?active=1  ?search=name"""
 
     permission_classes = [permissions.IsAuthenticated, IsOwner]
-    serializer_class = EnrollmentSerializer
+    # No PUT and no DELETE: an enrolment is ended, never removed.
+    http_method_names = ["get", "post", "patch", "head", "options"]
 
-    def get_queryset(self):
-        queryset = (
+    def get_serializer_class(self):
+        if self.action == "create":
+            return EnrollmentCreateSerializer
+        if self.action in ("update", "partial_update"):
+            return EnrollmentUpdateSerializer
+        return EnrollmentSerializer
+
+    def _base_queryset(self):
+        return (
             enrollments_for(self.request.user)
             .select_related("student", "batch")
             .annotate(
@@ -437,6 +519,9 @@ class EnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
             )
             .order_by("student__full_name", "id")
         )
+
+    def get_queryset(self):
+        queryset = self._base_queryset()
         params = self.request.query_params
         if params.get("without_plan") == "1":
             queryset = queryset.filter(has_fee_plan=False)
@@ -446,6 +531,34 @@ class EnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
         if search:
             queryset = queryset.filter(student__full_name__icontains=search[:100])
         return queryset
+
+    def create(self, request, *args, **kwargs):
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        data = body.validated_data
+        try:
+            enrollment = enroll_student(
+                student=data["student"],
+                batch=data["batch"],
+                joined_on=data.get("joined_on"),
+            )
+        except EnrollmentError as error:
+            raise ValidationError({"detail": str(error)})
+        fresh = self._base_queryset().get(pk=enrollment.pk)
+        return Response(EnrollmentSerializer(fresh).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        enrollment = self.get_object()  # 404 if it does not exist
+        body = self.get_serializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        try:
+            set_enrollment_active(
+                enrollment=enrollment, is_active=body.validated_data["is_active"]
+            )
+        except EnrollmentError as error:
+            raise ValidationError({"detail": str(error)})
+        fresh = self._base_queryset().get(pk=enrollment.pk)
+        return Response(EnrollmentSerializer(fresh).data)
 
 # ---- Attendance (reading) -------------------------------------------------
 

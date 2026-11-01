@@ -634,13 +634,16 @@ class ApiTests(TestCase):
         after = self.count_queries(self.owner, reverse("batch-list"))
         self.assertEqual(before, after)
 
-    def test_students_are_read_only_and_batches_cannot_be_deleted(self):
+    def test_students_and_batches_cannot_be_deleted_or_replaced(self):
         self.api.force_authenticate(user=self.owner)
-        response = self.api.post(reverse("student-list"), {"full_name": "X"})
-        self.assertEqual(response.status_code, 405)
-        url = reverse("batch-detail", args=[self.batch_a.pk])
-        self.assertEqual(self.api.delete(url).status_code, 405)
-        self.assertEqual(self.api.put(url, {"name": "X"}, format="json").status_code, 405)
+        for name, pk in (
+            ("student-detail", self.asha.pk),
+            ("batch-detail", self.batch_a.pk),
+        ):
+            url = reverse(name, args=[pk])
+            self.assertEqual(self.api.delete(url).status_code, 405, name)
+            response = self.api.put(url, {"name": "X"}, format="json")
+            self.assertEqual(response.status_code, 405, name)
 
 class ApiWriteTests(TestCase):
     def setUp(self):
@@ -2167,3 +2170,536 @@ class BatchAdminApiTests(TestCase):
         self.assertEqual(
             self.get(self.teacher_a, "batch-attendance", batch_id).status_code, 404
         )
+
+class StudentAdminApiTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        self.parent2 = mk("par2", password="pw", role=User.Role.STUDENT)
+        self.retired_parent = mk(
+            "oldpar", password="pw", role=User.Role.STUDENT, is_active=False
+        )
+        mkb = Batch.objects.create
+        self.batch_a = mkb(name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1))
+        self.batch_b = mkb(name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1))
+        self.closed = mkb(
+            name="Closed", teacher=self.teacher_a,
+            start_date=date(2025, 6, 1), is_active=False,
+        )
+        self.api = APIClient()
+
+    # ---- helpers ----
+    def post(self, user, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(reverse("student-list"), body, format="json")
+
+    def patch(self, user, student, body):
+        self.api.force_authenticate(user=user)
+        url = reverse("student-detail", args=[student.pk])
+        return self.api.patch(url, body, format="json")
+
+    def get(self, user, params=None):
+        self.api.force_authenticate(user=user)
+        return self.api.get(reverse("student-list"), params or {})
+
+    def names(self, user, params=None):
+        return [row["full_name"] for row in self.get(user, params).data["results"]]
+
+    def body(self, **changes):
+        data = {
+            "full_name": "Asha Rao",
+            "phone": "9876543210",
+            "guardian_name": "Mr Rao",
+        }
+        data.update(changes)
+        return data
+
+    def make_student(self, name="Existing", phone="9000000001", **extra):
+        return Student.objects.create(full_name=name, phone=phone, **extra)
+
+    def enrol(self, student, batch, active=True):
+        return Enrollment.objects.create(
+            student=student, batch=batch, joined_on=date(2026, 6, 1), is_active=active
+        )
+
+    def make_people(self):
+        self.asha = self.make_student("Asha", "9000000001", user=self.parent)
+        self.bala = self.make_student("Bala", "9000000002")
+        self.chetan = self.make_student("Chetan", "9000000003", is_active=False)
+        self.dev = self.make_student("Dev", "9000000004")
+        self.enrol(self.asha, self.batch_a)
+        self.enrol(self.asha, self.batch_b)
+        self.enrol(self.bala, self.batch_b)
+        self.enrol(self.dev, self.batch_a)
+
+    # ---- permissions ----
+    def test_only_the_owner_can_add_or_edit_students(self):
+        student = self.make_student()
+        self.assertEqual(self.post(None, self.body()).status_code, 403)
+        for user in (self.teacher_a, self.parent):
+            self.assertEqual(self.post(user, self.body()).status_code, 403)
+            response = self.patch(user, student, {"full_name": "Changed"})
+            self.assertEqual(response.status_code, 403)
+        self.assertEqual(Student.objects.count(), 1)
+        student.refresh_from_db()
+        self.assertEqual(student.full_name, "Existing")
+
+    # ---- adding ----
+    def test_owner_adds_a_student(self):
+        response = self.post(self.owner, self.body(phone="98765-43210"))
+        self.assertEqual(response.status_code, 201)
+        data = response.data
+        self.assertEqual(data["full_name"], "Asha Rao")
+        self.assertEqual(data["phone"], "9876543210")  # tidied up
+        self.assertEqual(data["guardian_name"], "Mr Rao")
+        self.assertIsNone(data["user"])
+        self.assertIsNone(data["parent_name"])
+        self.assertEqual(data["enrollments"], [])
+        self.assertTrue(data["is_active"])
+        self.assertEqual(Student.objects.count(), 1)
+        self.assertEqual(Enrollment.objects.count(), 0)
+
+    def test_a_student_can_be_enrolled_and_linked_to_a_parent_in_one_step(self):
+        response = self.post(
+            self.owner,
+            self.body(batch=self.batch_a.pk, joined_on="2026-09-15", user=self.parent.pk),
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["user"], self.parent.pk)
+        self.assertEqual(response.data["parent_name"], "par")
+        rows = response.data["enrollments"]
+        self.assertEqual(
+            [(r["batch"], r["batch_name"], r["joined_on"], r["is_active"]) for r in rows],
+            [(self.batch_a.pk, "A", "2026-09-15", True)],
+        )
+        self.assertEqual(Student.objects.get().user, self.parent)
+
+    def test_enrolment_date_defaults_to_today(self):
+        self.post(self.owner, self.body(batch=self.batch_a.pk))
+        self.assertEqual(Enrollment.objects.get().joined_on, timezone.localdate())
+
+    def test_phone_is_required_and_must_look_like_a_phone_number(self):
+        for phone in ["", "12345", "98765abcde", "+", "9" * 14, "9" * 21]:
+            response = self.post(self.owner, self.body(phone=phone))
+            self.assertEqual(response.status_code, 400, phone)
+        body = self.body()
+        del body["phone"]
+        self.assertEqual(self.post(self.owner, body).status_code, 400)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_name_is_required_and_limited(self):
+        for name in ["", "   ", "x" * 151]:
+            response = self.post(self.owner, self.body(full_name=name))
+            self.assertEqual(response.status_code, 400, name)
+        body = self.body()
+        del body["full_name"]
+        self.assertEqual(self.post(self.owner, body).status_code, 400)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_duplicate_name_and_phone_is_rejected_ignoring_case(self):
+        self.make_student("Asha Rao", "9876543210")
+        for name in ("Asha Rao", "ASHA RAO", "  asha rao "):
+            response = self.post(self.owner, self.body(full_name=name))
+            self.assertEqual(response.status_code, 400, name)
+        # the same number written with a space is the same number
+        response = self.post(self.owner, self.body(phone="98765 43210"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Student.objects.count(), 1)
+        # two different people can share a name
+        response = self.post(self.owner, self.body(phone="9876543211"))
+        self.assertEqual(response.status_code, 201)
+
+    def test_parent_link_must_be_an_active_parent_account(self):
+        for user_id in (self.teacher_a.pk, self.owner.pk, self.retired_parent.pk, 99999):
+            response = self.post(self.owner, self.body(user=user_id))
+            self.assertEqual(response.status_code, 400, user_id)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_joining_date_needs_a_batch(self):
+        response = self.post(self.owner, self.body(joined_on="2026-09-01"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Student.objects.count(), 0)
+
+    def test_a_closed_or_unknown_batch_leaves_nothing_behind(self):
+        for batch in (self.closed.pk, 99999):
+            response = self.post(self.owner, self.body(batch=batch))
+            self.assertEqual(response.status_code, 400, batch)
+        self.assertEqual(Student.objects.count(), 0)
+        self.assertEqual(Enrollment.objects.count(), 0)
+
+    # ---- editing ----
+    def test_owner_edits_a_student(self):
+        student = self.make_student("Old Name", "9000000001", guardian_name="G")
+        response = self.patch(
+            self.owner,
+            student,
+            {"full_name": "New Name", "guardian_name": "New G", "phone": "90000 00002"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["full_name"], "New Name")
+        self.assertEqual(response.data["phone"], "9000000002")
+        student.refresh_from_db()
+        self.assertEqual(
+            (student.full_name, student.guardian_name, student.phone),
+            ("New Name", "New G", "9000000002"),
+        )
+        # a bad phone is refused and changes nothing
+        self.assertEqual(self.patch(self.owner, student, {"phone": "123"}).status_code, 400)
+        student.refresh_from_db()
+        self.assertEqual(student.phone, "9000000002")
+        self.api.force_authenticate(user=self.owner)
+        missing = self.api.patch(
+            reverse("student-detail", args=[99999]), {}, format="json"
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    def test_editing_checks_for_clashes_only_when_name_or_phone_change(self):
+        a = self.make_student("Asha", "9000000001")
+        b = self.make_student("Bala", "9000000002")
+        response = self.patch(
+            self.owner, b, {"full_name": "asha", "phone": "9000000001"}
+        )
+        self.assertEqual(response.status_code, 400)
+        # changing only the capital letters of its own name is fine
+        self.assertEqual(
+            self.patch(self.owner, a, {"full_name": "ASHA"}).status_code, 200
+        )
+        # old data may already hold a duplicate pair. Editing other fields still works.
+        Student.objects.create(full_name="asha", phone="9000000001")
+        self.assertEqual(
+            self.patch(self.owner, a, {"guardian_name": "Mr A"}).status_code, 200
+        )
+
+    def test_parent_link_can_be_changed_and_removed(self):
+        student = self.make_student(user=self.parent)
+        response = self.patch(self.owner, student, {"user": self.parent2.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["parent_name"], "par2")
+        student.refresh_from_db()
+        self.assertEqual(student.user, self.parent2)
+
+        response = self.patch(self.owner, student, {"user": None})
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["user"])
+        self.assertIsNone(response.data["parent_name"])
+        student.refresh_from_db()
+        self.assertIsNone(student.user)
+
+        for user_id in (self.retired_parent.pk, self.teacher_a.pk):
+            response = self.patch(self.owner, student, {"user": user_id})
+            self.assertEqual(response.status_code, 400, user_id)
+
+    def test_deactivating_a_student_ends_their_enrolments(self):
+        student = self.make_student("Leaver", "9000000005")
+        other = self.make_student("Stayer", "9000000006")
+        e1 = self.enrol(student, self.batch_a)
+        e2 = self.enrol(student, self.batch_b)
+        e3 = self.enrol(other, self.batch_a)
+
+        response = self.patch(self.owner, student, {"is_active": False})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["is_active"])
+        self.assertEqual([e["is_active"] for e in response.data["enrollments"]], [False, False])
+        for enrollment in (e1, e2):
+            enrollment.refresh_from_db()
+            self.assertFalse(enrollment.is_active)
+        e3.refresh_from_db()
+        self.assertTrue(e3.is_active)
+
+        # the leaver is gone from the teacher's attendance sheet
+        self.api.force_authenticate(user=self.teacher_a)
+        roster = self.api.get(reverse("batch-attendance", args=[self.batch_a.pk]))
+        self.assertEqual([r["student_name"] for r in roster.data["records"]], ["Stayer"])
+
+        # reactivating the student does not silently bring the enrolments back
+        self.assertEqual(
+            self.patch(self.owner, student, {"is_active": True}).status_code, 200
+        )
+        e1.refresh_from_db()
+        self.assertFalse(e1.is_active)
+
+    def test_students_cannot_be_replaced_or_deleted(self):
+        student = self.make_student()
+        self.api.force_authenticate(user=self.owner)
+        url = reverse("student-detail", args=[student.pk])
+        self.assertEqual(self.api.put(url, self.body(), format="json").status_code, 405)
+        self.assertEqual(self.api.delete(url).status_code, 405)
+        self.assertTrue(Student.objects.filter(pk=student.pk).exists())
+
+    # ---- listing ----
+    def test_owner_list_has_enrolments_and_filters(self):
+        self.make_people()
+        rows = self.get(self.owner).data["results"]
+        by_name = {row["full_name"]: row for row in rows}
+        self.assertEqual(
+            set(by_name["Asha"]),
+            {"id", "full_name", "phone", "guardian_name", "user",
+             "parent_name", "is_active", "enrollments"},
+        )
+        self.assertEqual([e["batch_name"] for e in by_name["Asha"]["enrollments"]], ["A", "B"])
+        self.assertEqual(by_name["Asha"]["parent_name"], "par")
+        self.assertIsNone(by_name["Bala"]["user"])
+
+        owner = self.owner
+        self.assertEqual(self.names(owner), ["Asha", "Bala", "Chetan", "Dev"])
+        self.assertEqual(self.names(owner, {"search": "ala"}), ["Bala"])
+        self.assertEqual(self.names(owner, {"search": "0003"}), ["Chetan"])  # by phone
+        self.assertEqual(self.names(owner, {"active": "1"}), ["Asha", "Bala", "Dev"])
+        self.assertEqual(self.names(owner, {"batch": self.batch_a.pk}), ["Asha", "Dev"])
+        self.assertEqual(self.names(owner, {"batch": self.batch_b.pk}), ["Asha", "Bala"])
+        self.assertEqual(
+            self.names(owner, {"without_parent": "1"}), ["Bala", "Chetan", "Dev"]
+        )
+        self.assertEqual(
+            self.names(owner, {"batch": self.batch_b.pk, "without_parent": "1"}), ["Bala"]
+        )
+
+    def test_teachers_and_parents_keep_the_basic_view(self):
+        self.make_people()
+        rows = self.get(self.teacher_a).data["results"]
+        self.assertEqual([r["full_name"] for r in rows], ["Asha", "Dev"])
+        basic = {"id", "full_name", "phone", "guardian_name", "is_active"}
+        self.assertEqual(set(rows[0]), basic)
+        # the owner-only filters are ignored, so a teacher cannot probe other batches
+        self.assertEqual(
+            self.names(self.teacher_a, {"batch": self.batch_b.pk}), ["Asha", "Dev"]
+        )
+        self.assertEqual(
+            self.names(self.teacher_a, {"without_parent": "1"}), ["Asha", "Dev"]
+        )
+        rows = self.get(self.parent).data["results"]
+        self.assertEqual([r["full_name"] for r in rows], ["Asha"])
+        self.assertEqual(set(rows[0]), basic)
+
+    def test_owner_list_query_count_does_not_grow(self):
+        self.make_people()
+        self.api.force_authenticate(user=self.owner)
+        url = reverse("student-list")
+        with CaptureQueriesContext(connection) as before:
+            self.api.get(url)
+        for i in range(5):
+            student = self.make_student(f"Extra {i}", f"90000001{i:02d}", user=self.parent2)
+            self.enrol(student, self.batch_a)
+            self.enrol(student, self.batch_b)
+        with CaptureQueriesContext(connection) as after:
+            self.api.get(url)
+        self.assertEqual(len(before), len(after))
+
+    def test_odd_filter_values_do_not_crash(self):
+        self.make_people()
+        for name in ("search", "batch", "active", "without_parent"):
+            for value in ["²", "9" * 40, "abc", "-1", "", " ", "x" * 500]:
+                response = self.get(self.owner, {name: value})
+                self.assertEqual(response.status_code, 200, (name, value))
+
+
+class EnrollmentWriteApiTests(TestCase):
+    def setUp(self):
+        mk = User.objects.create_user
+        self.owner = mk("own", password="pw", role=User.Role.OWNER)
+        self.teacher_a = mk("ta", password="pw", role=User.Role.TEACHER)
+        self.teacher_b = mk("tb", password="pw", role=User.Role.TEACHER)
+        self.parent = mk("par", password="pw", role=User.Role.STUDENT)
+        mkb = Batch.objects.create
+        self.batch_a = mkb(name="A", teacher=self.teacher_a, start_date=date(2026, 6, 1))
+        self.batch_b = mkb(name="B", teacher=self.teacher_b, start_date=date(2026, 6, 1))
+        self.closed = mkb(
+            name="Closed", teacher=self.teacher_a,
+            start_date=date(2025, 6, 1), is_active=False,
+        )
+        mks = Student.objects.create
+        self.asha = mks(full_name="Asha", phone="9000000001", user=self.parent)
+        self.bala = mks(full_name="Bala", phone="9000000002")
+        self.gone = mks(full_name="Gone", phone="9000000003", is_active=False)
+        self.enr_asha_a = Enrollment.objects.create(
+            student=self.asha, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+        self.api = APIClient()
+
+    def post(self, user, body):
+        self.api.force_authenticate(user=user)
+        return self.api.post(reverse("enrollment-list"), body, format="json")
+
+    def patch(self, user, enrollment, body):
+        self.api.force_authenticate(user=user)
+        url = reverse("enrollment-detail", args=[enrollment.pk])
+        return self.api.patch(url, body, format="json")
+
+    def get(self, user, name, *args):
+        self.api.force_authenticate(user=user)
+        return self.api.get(reverse(name, args=list(args)))
+
+    def test_only_the_owner_can_enrol_or_change_enrolments(self):
+        body = {"student": self.bala.pk, "batch": self.batch_a.pk}
+        self.assertEqual(self.post(None, body).status_code, 403)
+        for user in (self.teacher_a, self.parent):
+            self.assertEqual(self.post(user, body).status_code, 403)
+            response = self.patch(user, self.enr_asha_a, {"is_active": False})
+            self.assertEqual(response.status_code, 403)
+        self.assertEqual(Enrollment.objects.count(), 1)
+        self.enr_asha_a.refresh_from_db()
+        self.assertTrue(self.enr_asha_a.is_active)
+
+    def test_owner_enrols_an_existing_student_and_access_follows(self):
+        response = self.post(
+            self.owner,
+            {"student": self.asha.pk, "batch": self.batch_b.pk, "joined_on": "2026-10-20"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["student_name"], "Asha")
+        self.assertEqual(response.data["batch_name"], "B")
+        self.assertEqual(response.data["joined_on"], "2026-10-20")
+        self.assertTrue(response.data["is_active"])
+        self.assertFalse(response.data["has_fee_plan"])
+        self.assertEqual(Enrollment.objects.count(), 2)
+
+        # the other batch's teacher can now see the student
+        listing = self.get(self.teacher_b, "student-list")
+        self.assertEqual([r["full_name"] for r in listing.data["results"]], ["Asha"])
+        # and the parent now sees both batches
+        batches = self.get(self.parent, "batch-list")
+        self.assertEqual([b["name"] for b in batches.data["results"]], ["A", "B"])
+
+    def test_enrolment_date_defaults_to_today(self):
+        response = self.post(
+            self.owner, {"student": self.bala.pk, "batch": self.batch_a.pk}
+        )
+        self.assertEqual(response.status_code, 201)
+        enrollment = Enrollment.objects.get(student=self.bala)
+        self.assertEqual(enrollment.joined_on, timezone.localdate())
+
+    def test_duplicate_enrolments_are_refused(self):
+        body = {"student": self.asha.pk, "batch": self.batch_a.pk}
+        response = self.post(self.owner, body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already enrolled", str(response.data["detail"]))
+        # after the student leaves the batch, a new row is refused. Reactivate instead.
+        self.patch(self.owner, self.enr_asha_a, {"is_active": False})
+        response = self.post(self.owner, body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Reactivate", str(response.data["detail"]))
+        self.assertEqual(Enrollment.objects.count(), 1)
+
+    def test_bad_input_is_refused(self):
+        cases = [
+            {"student": self.gone.pk, "batch": self.batch_a.pk},  # inactive student
+            {"student": self.bala.pk, "batch": self.closed.pk},  # inactive batch
+            {"student": 99999, "batch": self.batch_a.pk},
+            {"student": self.bala.pk, "batch": 99999},
+            {"batch": self.batch_a.pk},
+            {"student": self.bala.pk},
+            {"student": self.bala.pk, "batch": self.batch_a.pk, "joined_on": "01/06/2026"},
+            {"student": self.bala.pk, "batch": self.batch_a.pk, "joined_on": "2026-02-31"},
+        ]
+        for body in cases:
+            self.assertEqual(self.post(self.owner, body).status_code, 400, body)
+        self.assertEqual(Enrollment.objects.count(), 1)
+
+    def test_owner_can_end_and_restore_an_enrolment(self):
+        Enrollment.objects.create(
+            student=self.bala, batch=self.batch_a, joined_on=date(2026, 6, 1)
+        )
+
+        def roster():
+            data = self.get(self.teacher_a, "batch-attendance", self.batch_a.pk).data
+            return [r["student_name"] for r in data["records"]]
+
+        self.assertEqual(roster(), ["Asha", "Bala"])
+        response = self.patch(self.owner, self.enr_asha_a, {"is_active": False})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["is_active"])
+        self.assertEqual(response.data["student_name"], "Asha")
+        self.assertEqual(roster(), ["Bala"])
+
+        # the owner still sees it, unless asking for active ones only
+        self.api.force_authenticate(user=self.owner)
+        url = reverse("enrollment-list")
+        listed = self.api.get(url, {"search": "Asha"})
+        self.assertEqual([r["is_active"] for r in listed.data["results"]], [False])
+        listed = self.api.get(url, {"search": "Asha", "active": "1"})
+        self.assertEqual(listed.data["results"], [])
+
+        response = self.patch(self.owner, self.enr_asha_a, {"is_active": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(roster(), ["Asha", "Bala"])
+
+    def test_restoring_needs_an_active_student_and_batch(self):
+        gone_enr = Enrollment.objects.create(
+            student=self.gone, batch=self.batch_a,
+            joined_on=date(2026, 6, 1), is_active=False,
+        )
+        closed_enr = Enrollment.objects.create(
+            student=self.bala, batch=self.closed,
+            joined_on=date(2026, 6, 1), is_active=False,
+        )
+        for enrollment in (gone_enr, closed_enr):
+            response = self.patch(self.owner, enrollment, {"is_active": True})
+            self.assertEqual(response.status_code, 400)
+            enrollment.refresh_from_db()
+            self.assertFalse(enrollment.is_active)
+
+        # ending an enrolment is always allowed, even after its batch closed
+        batch_c = Batch.objects.create(
+            name="C", teacher=self.teacher_a, start_date=date(2026, 6, 1)
+        )
+        enr_c = Enrollment.objects.create(
+            student=self.bala, batch=batch_c, joined_on=date(2026, 6, 1)
+        )
+        batch_c.is_active = False
+        batch_c.save()
+        self.assertEqual(
+            self.patch(self.owner, enr_c, {"is_active": False}).status_code, 200
+        )
+
+    def test_bad_patch_bodies_are_refused(self):
+        for body in ({}, {"is_active": "maybe"}):
+            response = self.patch(self.owner, self.enr_asha_a, body)
+            self.assertEqual(response.status_code, 400, body)
+        self.enr_asha_a.refresh_from_db()
+        self.assertTrue(self.enr_asha_a.is_active)
+
+    def test_enrolments_cannot_be_replaced_or_deleted_and_missing_ones_are_404(self):
+        self.api.force_authenticate(user=self.owner)
+        url = reverse("enrollment-detail", args=[self.enr_asha_a.pk])
+        put = self.api.put(url, {"is_active": False}, format="json")
+        self.assertEqual(put.status_code, 405)
+        self.assertEqual(self.api.delete(url).status_code, 405)
+        self.assertTrue(Enrollment.objects.filter(pk=self.enr_asha_a.pk).exists())
+        missing = self.api.patch(
+            reverse("enrollment-detail", args=[99999]),
+            {"is_active": False},
+            format="json",
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    def test_has_fee_plan_flag_survives_ending_an_enrolment(self):
+        create_fee_plan(
+            enrollment=self.enr_asha_a,
+            total_amount="1000.00",
+            due_dates=[date(2026, 11, 1)],
+        )
+        response = self.patch(self.owner, self.enr_asha_a, {"is_active": False})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["has_fee_plan"])
+
+
+class ImportInactiveStudentTests(TestCase):
+    def test_inactive_existing_student_is_rejected(self):
+        teacher = User.objects.create_user(
+            "t_inact", password="pw", role=User.Role.TEACHER
+        )
+        Batch.objects.create(
+            name="JEE Morning", teacher=teacher, start_date=date(2026, 6, 1)
+        )
+        Student.objects.create(
+            full_name="Asha", phone="9876543210", is_active=False
+        )
+        raw = b"full_name,phone,batch\nAsha,9876543210,JEE Morning\n"
+        result = import_students(raw=raw, commit=True)
+        self.assertFalse(result["committed"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["field"], "full_name")
+        self.assertEqual(Enrollment.objects.count(), 0)
