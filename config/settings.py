@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 import os
 import sys
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 
 from dotenv import load_dotenv
 
@@ -31,8 +32,6 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv("DEBUG", "False") == "True"
 
-ALLOWED_HOSTS = []
-
 
 # Application definition
 
@@ -49,6 +48,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -156,7 +156,74 @@ LOGIN_REDIRECT_URL = "/api/"
 
 # The React dev server runs on its own port. Django must trust its origin for
 # POST requests. Change this list when you deploy to a real domain.
-CSRF_TRUSTED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+# ---- Deployment settings ---------------------------------------------------
+# Everything here is controlled by environment variables, so the same code
+# runs on your laptop and on a server.
+
+
+def _csv(name):
+    """A comma-separated environment variable, as a list."""
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+# Which web addresses may reach this server. Empty is fine on your computer
+# (Django allows localhost while DEBUG is on). A server must list its address.
+ALLOWED_HOSTS = _csv("ALLOWED_HOSTS")
+
+# Addresses allowed to send logged-in POST requests, written with https://
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    *_csv("CSRF_TRUSTED_ORIGINS"),
+]
+
+# Hosts usually give one DATABASE_URL instead of separate DB_NAME, DB_USER, ...
+if os.getenv("DATABASE_URL"):
+    import dj_database_url
+
+    DATABASES = {
+        "default": dj_database_url.parse(os.environ["DATABASE_URL"], conn_max_age=600)
+    }
+
+# One server for everything: Django serves the API, and WhiteNoise serves the
+# React build (frontend/dist) and Django's own static files (such as the admin).
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"},
+}
+WHITENOISE_ROOT = BASE_DIR / "frontend" / "dist"
+WHITENOISE_INDEX_FILE = True
+
+# Switched on only on a real server, by setting PRODUCTION=True there.
+PRODUCTION = os.getenv("PRODUCTION", "False") == "True"
+if PRODUCTION:
+    # Refuse to start with unsafe settings, instead of running unsafely.
+    if DEBUG:
+        raise ImproperlyConfigured("DEBUG must be off in production.")
+    if not SECRET_KEY or len(SECRET_KEY) < 40 or SECRET_KEY.startswith("django-insecure"):
+        raise ImproperlyConfigured("Set a long, random SECRET_KEY for production.")
+    if not ALLOWED_HOSTS:
+        raise ImproperlyConfigured("Set ALLOWED_HOSTS to your site's address.")
+
+    # The host's load balancer handles HTTPS and tells Django through this header.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "True") == "True"
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True  # leave CSRF_COOKIE_HTTPONLY alone: React reads this cookie
+    # Browsers remember HSTS, so start with one hour. Raise it once all is well.
+    SECURE_HSTS_SECONDS = int(os.getenv("HSTS_SECONDS", "3600"))
+    # These two commit a whole domain to HTTPS for good. Not for a host's shared domain.
+    SILENCED_SYSTEM_CHECKS = ["security.W005", "security.W021"]
+    # This app sends no email today. If you add features that do (such as
+    # password reset), put your real SMTP details in "OPTIONS" below.
+    MAILERS = {
+        "default": {
+            "BACKEND": "django.core.mail.backends.smtp.EmailBackend",
+            "OPTIONS": {"host": "localhost"},
+        },
+    }
 
 if "test" in sys.argv:
     # Real passwords are hashed slowly on purpose. Tests create many users,
