@@ -1,5 +1,7 @@
 # FeeLedger
 
+[![CI](https://github.com/harshninawe44-stack/FeeLedger/actions/workflows/ci.yml/badge.svg)](https://github.com/harshninawe44-stack/FeeLedger/actions/workflows/ci.yml)
+
 A fee and attendance manager for small coaching classes. Fees are split into installments and paid into an **append-only ledger**, teachers see **only their own batches**, and dues are computed by the database in a single query.
 
 ![Fees dashboard](docs/screenshots/fees-dashboard.png)
