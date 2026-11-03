@@ -1,3 +1,6 @@
+import os
+from unittest import mock
+
 from datetime import date, timedelta
 from django.utils import timezone
 from decimal import Decimal
@@ -2923,3 +2926,74 @@ class SeedDemoTests(TestCase):
             marked = set(session.records.values_list("student_id", flat=True))
             self.assertEqual(marked, enrolled)
         self.assertTrue(AttendanceChange.objects.exists())
+
+class CreateOwnerTests(TestCase):
+    STRONG = "Sturdy-Pass-7391"
+
+    def run_command(self, username="farm.owner", password=STRONG):
+        out = StringIO()
+        env = {"OWNER_USERNAME": username, "OWNER_PASSWORD": password}
+        with mock.patch.dict(os.environ, env):
+            call_command("create_owner", stdout=out)
+        return out.getvalue()
+
+    def owners(self):
+        return User.objects.filter(role=User.Role.OWNER)
+
+    def test_creates_the_owner_who_can_sign_in(self):
+        self.run_command()
+        owner = User.objects.get(username="farm.owner")
+        self.assertEqual(owner.role, User.Role.OWNER)
+        self.assertTrue(owner.is_superuser)
+        self.assertTrue(owner.is_active)
+        self.assertNotEqual(owner.password, self.STRONG)  # stored as a hash
+        self.assertTrue(owner.check_password(self.STRONG))
+
+    def test_does_nothing_when_the_variables_are_not_set(self):
+        for env in (
+            {"OWNER_USERNAME": "", "OWNER_PASSWORD": ""},
+            {"OWNER_USERNAME": "farm.owner", "OWNER_PASSWORD": ""},
+            {"OWNER_USERNAME": "", "OWNER_PASSWORD": self.STRONG},
+        ):
+            with mock.patch.dict(os.environ, env):
+                call_command("create_owner", stdout=StringIO())
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_leaves_an_existing_owner_alone(self):
+        existing = User.objects.create_superuser("first", password="original-pw-1")
+        out = self.run_command(username="second")
+        self.assertIn("already exists", out)
+        self.assertEqual(self.owners().count(), 1)
+        self.assertFalse(User.objects.filter(username="second").exists())
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password("original-pw-1"))
+
+    def test_weak_passwords_are_refused(self):
+        for password in ("short", "12345678", "password"):
+            with self.assertRaises(CommandError):
+                self.run_command(password=password)
+        with self.assertRaises(CommandError):  # too like the username
+            self.run_command(username="sunita.owner", password="sunita.owner1")
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_bad_usernames_are_refused(self):
+        for username in ("has space", "bad/name!", "x" * 151):
+            with self.assertRaises(CommandError):
+                self.run_command(username=username)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_a_taken_username_is_refused_ignoring_case(self):
+        User.objects.create_user("Farm.Owner", password="pw", role=User.Role.TEACHER)
+        with self.assertRaises(CommandError):
+            self.run_command(username="farm.owner")
+        self.assertEqual(self.owners().count(), 0)
+
+    def test_running_twice_creates_only_one_owner(self):
+        self.run_command()
+        self.run_command()
+        self.assertEqual(self.owners().count(), 1)
+
+    def test_the_password_is_never_printed(self):
+        out = self.run_command()
+        self.assertIn("farm.owner", out)
+        self.assertNotIn(self.STRONG, out)

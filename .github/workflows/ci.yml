@@ -83,3 +83,37 @@ jobs:
 
       - name: Build
         run: npm run build
+  
+    docker:
+    name: Docker build and smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and start the app with its database
+        run: docker compose up -d --build
+
+      - name: Wait for the site to answer
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8000/api/auth/csrf/ > /dev/null; then exit 0; fi
+            sleep 3
+          done
+          docker compose logs
+          exit 1
+
+      - name: Check the pages
+        run: |
+          curl -fsS http://localhost:8000/ | grep -qi "<html"
+          curl -fsS -o /dev/null http://localhost:8000/static/admin/css/base.css
+          curl -fsS -c jar -o /dev/null http://localhost:8000/api/auth/csrf/
+          TOKEN=$(grep csrftoken jar | awk '{print $7}')
+          curl -fsS -b jar -c jar -H "X-CSRFToken: $TOKEN" -H "Content-Type: application/json" \
+            -d '{"username":"owner","password":"Local-Owner-Pass-2026"}' \
+            http://localhost:8000/api/auth/login/
+          curl -fsS -b jar http://localhost:8000/api/me/ | grep -q '"role":"owner"'
+
+      - name: Show the app logs if something failed
+        if: failure()
+        run: docker compose logs

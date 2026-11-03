@@ -1,0 +1,36 @@
+# Starts the whole project for trying it locally: the app plus a database.
+#   docker compose up --build
+# Then open http://localhost:8000 and sign in as: owner / Local-Owner-Pass-2026
+# These passwords are for local use only.
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: feeledger
+      POSTGRES_PASSWORD: local-demo-only
+      POSTGRES_DB: feeledger
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feeledger -d feeledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      SECRET_KEY: local-demo-secret-key-change-me-0123456789abcdef
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      DATABASE_URL: postgres://feeledger:local-demo-only@db:5432/feeledger
+      OWNER_USERNAME: owner
+      OWNER_PASSWORD: Local-Owner-Pass-2026
+
+volumes:
+  pgdata:

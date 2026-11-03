@@ -110,6 +110,13 @@ Every demo account uses the password `Demo-Pass-2026`. These accounts are for lo
 | `demo_teacher1`, `demo_teacher2`, `demo_teacher3` | Teachers, one batch each |
 | `demo_parent1` to `demo_parent5` | Parents. `demo_parent1` has two children. |
 
+### Run it with Docker
+One command starts the app and a PostgreSQL database (needs Docker):
+```
+docker compose up --build
+```
+Open **http://localhost:8000** and sign in as `owner` / `Local-Owner-Pass-2026`. These credentials are for local use only. In a real deployment, set your own `SECRET_KEY`, `ALLOWED_HOSTS`, `DATABASE_URL`, `PRODUCTION=True`, and `OWNER_USERNAME` and `OWNER_PASSWORD` (the first owner account is created once, from these two values, when the server starts).
+
 ### Run the tests
 ```
 python manage.py test --keepdb
