@@ -178,6 +178,13 @@ CSRF_TRUSTED_ORIGINS = [
     *_csv("CSRF_TRUSTED_ORIGINS"),
 ]
 
+# Render tells every service its own public address in this variable, so the
+# first deploy works without knowing the address in advance.
+_render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if _render_host:
+    ALLOWED_HOSTS.append(_render_host)
+    CSRF_TRUSTED_ORIGINS.append(f"https://{_render_host}")
+
 # Hosts usually give one DATABASE_URL instead of separate DB_NAME, DB_USER, ...
 if os.getenv("DATABASE_URL"):
     import dj_database_url
@@ -185,6 +192,9 @@ if os.getenv("DATABASE_URL"):
     DATABASES = {
         "default": dj_database_url.parse(os.environ["DATABASE_URL"], conn_max_age=600)
     }
+    # A serverless database goes to sleep when idle. Before reusing an old
+    # connection, Django checks that it is still alive, and reconnects if not.
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 
 # One server for everything: Django serves the API, and WhiteNoise serves the
 # React build (frontend/dist) and Django's own static files (such as the admin).
